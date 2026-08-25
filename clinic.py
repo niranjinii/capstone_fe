@@ -44,5 +44,16 @@ payload = {
 }
 cloud_response = requests.post('http://127.0.0.1:5002/evaluate', json=payload)
 
+# 7. Correct for the constant weight shift applied during quantisation
+#    Cloud computed: <x, w+C> = <x, w> + C * sum(x)
+#    We recover:     <x, w>   = result - C * sum(x)
+shift_resp = requests.get('http://127.0.0.1:5001/get_weight_shift').json()
+weight_shift = shift_resp['weight_shift']
+raw_result = cloud_response.json()['encrypted_result']
+correction = weight_shift * sum(quantized_patient_vector)
+true_score = raw_result - correction
+
 print(f"\n--- Final Clinical Prediction from Cloud ---")
-print(f"Computed Risk Score: {cloud_response.json()['encrypted_result']}")
+print(f"Cloud returned (shifted): {raw_result}")
+print(f"Weight shift correction:  -{correction} (C={weight_shift} × Σx={sum(quantized_patient_vector)})")
+print(f"True Risk Score:          {true_score}")

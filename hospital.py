@@ -25,10 +25,18 @@ active_indices = np.flatnonzero(selected_model_weights != 0)
 FEASIBLE_DIM = len(active_indices)
 trimmed_weights = selected_model_weights[active_indices]
 
-# 3. Quantize and ensure weights are strictly positive integers (avoiding PyMIFE k2 None bugs)
+# 3. Quantize weights, preserving sign (negative Lasso coefficients indicate suppression)
 SCALING_FACTOR = 100.0
-# Using absolute value or shifting ensures keygen never returns None elements in k2
-quantized_weights = [int(abs(val)) + 1 for val in np.rint(trimmed_weights * SCALING_FACTOR)]
+raw_quantized = [int(val) for val in np.rint(trimmed_weights * SCALING_FACTOR)]
+
+# Constant shift: PyMIFE's FeDDH.keygen() returns None in k2 for zero-valued weights.
+# Instead of abs() (which destroys sign), we shift ALL weights by a constant C so they
+# are all strictly positive. The Clinic corrects for this after decryption:
+#   Cloud computes: <x, w+C> = <x, w> + C * sum(x)
+#   Clinic recovers: <x, w> = result - C * sum(x)
+WEIGHT_SHIFT = max(0, -min(raw_quantized)) + 1
+quantized_weights = [w + WEIGHT_SHIFT for w in raw_quantized]
+print(f"Quantized {len(quantized_weights)} weights (shift C={WEIGHT_SHIFT} to ensure all > 0)")
 
 DIMENSION = len(quantized_weights)
 print(f"Configuring FeDDH for dimension n={DIMENSION} using mclbn256 C++ backend...")
@@ -51,6 +59,12 @@ def get_active_indices():
 @app.route('/get_ek', methods=['GET'])
 def get_ek():
     return jsonify({"ek": serialize_ek(ek)})
+
+@app.route('/get_weight_shift', methods=['GET'])
+def get_weight_shift():
+    """Clinic: Returns the constant shift C applied to weights during quantisation.
+    The Clinic must subtract C * sum(x) from the Cloud's result to recover the true score."""
+    return jsonify({"weight_shift": WEIGHT_SHIFT})
 
 @app.route('/get_key', methods=['GET'])
 def get_key():
