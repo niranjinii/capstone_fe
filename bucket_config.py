@@ -5,22 +5,21 @@ CANCER_TYPES = [
     "SARC", "SKCM", "STAD", "TGCT", "THCA", "THYM", "UCEC", "UCS", "UVM"
 ]
 
-# Development bucket dimensions for instantaneous local testing
+# Production bucket dimensions based on true active gene counts
 BUCKETS = {
     "small": {
-        "max_dim": 8,
+        "max_dim": 100,
         "cancers": ["THYM", "GBM", "KICH", "PCPG", "TGCT", "DLBC", "UVM", "PAAD", "LAML", "PRAD"]
     },
     "medium": {
-        "max_dim": 16,
+        "max_dim": 150,
         "cancers": [
             "CHOL", "READ", "LIHC", "COAD", "UCS", "THCA", "MESO", "HNSC",
-            "OV", "LUAD", "ACC", "STAD", "SKCM", "LGG", "SARC", "KIRP",
-            "ESCA", "LUSC", "UCEC", "KIRC"
+            "OV", "LUAD", "ACC", "STAD", "SKCM"
         ]
     },
     "large": {
-        "max_dim": 24,
-        "cancers": ["BRCA", "BLCA", "CESC"]
+        "max_dim": 300,
+        "cancers": ["LGG", "SARC", "KIRP", "ESCA", "LUSC", "UCEC", "KIRC", "BRCA", "BLCA", "CESC"]
     }
 }

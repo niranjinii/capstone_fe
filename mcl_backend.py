@@ -189,8 +189,11 @@ class MclPairing(PairingBase):
 
     def identityT(self) -> MclGTWrapper:
         if self._identity_t is None:
-            g = mclbn256.GT()
-            g.clear()
+            g1 = mclbn256.G1()
+            g1.clear()
+            g2 = mclbn256.G2()
+            g2.clear()
+            g = g1.pairing(g2)
             self._identity_t = MclGTWrapper(g)
         return self._identity_t
 
