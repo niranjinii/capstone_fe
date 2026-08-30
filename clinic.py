@@ -1,59 +1,49 @@
 import numpy as np
-import pandas as pd
 import requests
 from delegated_crypto import deserialize_ek, delegated_encrypt
+from bucketing import pad_patient_vector, build_batch_payload
 
-print("--- Starting Clinic Inference Workflow ---")
+print("=== Clinic Query & Inference Workflow ===")
 
-# 1. Get dimension dynamically from Hospital to match the model shape
-dim_resp = requests.get('http://127.0.0.1:5001/get_dimension').json()
-n = dim_resp['dimension']
-print(f"Model dimension expected: {n}")
+# 1. Retrieve Model & Bucket Metadata from Hospital
+info_resp = requests.get("http://127.0.0.1:5001/get_model_info").json()
+cancer_name = info_resp["cancer_name"]
+active_features_count = info_resp["active_features_count"]
+bucket_name = info_resp["bucket_name"]
+bucket_dim = info_resp["bucket_dimension"]
 
-# 2. Dynamically fetch the required gene indices and load the patient data
-indices_resp = requests.get('http://127.0.0.1:5001/get_active_indices').json()
-active_indices = indices_resp['active_indices']
+print(f"Target: {cancer_name} | Bucket: '{bucket_name}' (Dimension: {bucket_dim})")
 
-print(f"Loading full patient data and filtering to {len(active_indices)} active genes...")
-patient_full_vector = np.load('patient1_full.npy')
-raw_patient_vector = patient_full_vector[active_indices]
+# 2. Simulate & Pad Patient Expression Vector
+np.random.seed(42)
+raw_patient = np.random.randn(active_features_count)
+SCALING_FACTOR = 5.0
+raw_quantized_patient = [int(abs(val)) + 1 for val in np.rint(np.abs(raw_patient) * SCALING_FACTOR)]
 
-# Quantize patient data using the exact same scaling factor
-SCALING_FACTOR = 100.0
-quantized_patient_vector = np.rint(raw_patient_vector * SCALING_FACTOR).astype(np.int64).tolist()
+padded_patient = pad_patient_vector(raw_quantized_patient, bucket_dim)
 
-# 3. Fetch the delegated encryption key (ek) from the Hospital[cite: 1]
+# 3. Fetch Delegated Encryption Key (ek)[cite: 1]
 print("Fetching Delegated Encryption Key (ek)...")
-ek_response = requests.get('http://127.0.0.1:5001/get_ek')
-ek = deserialize_ek(ek_response.json()['ek'])
+ek_resp = requests.get("http://127.0.0.1:5001/get_ek").json()
+ek = deserialize_ek(ek_resp["ek"])
 
-# 4. Encrypt patient data locally using O(n^2) delegated exponentiation[cite: 1]
-print(f"Encrypting patient vector of size {n} using delegated crypto...")
-json_ct = delegated_encrypt(ek, quantized_patient_vector)
+# 4. Encrypt Padded Vector via Delegated Crypto[cite: 1]
+print(f"Encrypting padded vector of size {bucket_dim} via delegated crypto...")
+json_ct = delegated_encrypt(ek, padded_patient)
 
-# 5. Fetch the sealed functional key from the Hospital[cite: 1]
-print("Fetching sealed functional key...")
-key_response = requests.get('http://127.0.0.1:5001/get_key')
-json_sk = key_response.json()['functional_key']
+# 5. Fetch Sealed Functional Key[cite: 1]
+print("Fetching sealed functional key from Hospital...")
+key_resp = requests.get("http://127.0.0.1:5001/get_key").json()
+json_sk = key_resp["functional_key"]
 
-# 6. Send payload to Cloud for secure evaluation
-print("Sending payloads to Cloud for secure evaluation...")
-payload = {
-    "ciphertext": json_ct,
-    "functional_key": json_sk
-}
-cloud_response = requests.post('http://127.0.0.1:5002/evaluate', json=payload)
+# 6. Evaluate Single Query
+print("Dispatching evaluation to Cloud...")
+single_payload = {"ciphertext": json_ct, "functional_key": json_sk}
+cloud_resp = requests.post("http://127.0.0.1:5002/evaluate", json=single_payload).json()
+print(f"Single Query Score: {cloud_resp.get('encrypted_result')}")
 
-# 7. Correct for the constant weight shift applied during quantisation
-#    Cloud computed: <x, w+C> = <x, w> + C * sum(x)
-#    We recover:     <x, w>   = result - C * sum(x)
-shift_resp = requests.get('http://127.0.0.1:5001/get_weight_shift').json()
-weight_shift = shift_resp['weight_shift']
-raw_result = cloud_response.json()['encrypted_result']
-correction = weight_shift * sum(quantized_patient_vector)
-true_score = raw_result - correction
-
-print(f"\n--- Final Clinical Prediction from Cloud ---")
-print(f"Cloud returned (shifted): {raw_result}")
-print(f"Weight shift correction:  -{correction} (C={weight_shift} × Σx={sum(quantized_patient_vector)})")
-print(f"True Risk Score:          {true_score}")
+# 7. Test Parallel Batch Endpoint
+print("\nTesting /evaluate_batch endpoint with duplicate parallel payload...")
+batch_payload = build_batch_payload([json_ct, json_ct], [json_sk, json_sk])
+batch_resp = requests.post("http://127.0.0.1:5002/evaluate_batch", json=batch_payload).json()
+print(f"Batch Parallel Results: {batch_resp.get('results')}")
