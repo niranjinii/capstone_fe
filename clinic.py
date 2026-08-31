@@ -1,8 +1,14 @@
 import sys
 import math
+import uuid
+import time
 import numpy as np
 import requests
+import json
 import logging
+from nacl.signing import SigningKey, VerifyKey
+import nacl.encoding
+from nacl.exceptions import BadSignatureError
 from delegated_crypto import deserialize_ek, delegated_encrypt
 from bucketing import pad_patient_vector, build_batch_payload
 from rho_blinding import extend_patient_vector, correct_blinded_result
@@ -12,13 +18,65 @@ logger = logging.getLogger("Clinic")
 
 logger.info("--- Starting Clinic Inference Workflow (XAI & Security Edition) ---")
 
-HOSPITAL_URL = 'http://127.0.0.1:5001'
-CLOUD_URL = 'http://127.0.0.1:5002'
+HOSPITAL_URL = 'https://127.0.0.1:5001'
+CLOUD_URL    = 'https://127.0.0.1:5002'
+
+# --- mTLS client credentials (Task 5, Item #7) ---
+# SESSION_KWARGS is splatted into every requests.get/post call so that:
+#   cert=   presents the Clinic's own certificate to the server (mTLS client auth)
+#   verify= tells requests to validate the server cert against our private CA
+SESSION_KWARGS = {
+    'cert':   ('clinic.pem', 'clinic-key.pem'),
+    'verify': 'ca.pem',
+}
+
+# --- Payload Signing (Task 6, Item #7) ---
+clinic_signing_key = SigningKey.generate()
+clinic_vk_hex = clinic_signing_key.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode('utf-8')
+
+logger.info("Fetching Ed25519 verify keys from Hospital and Cloud...")
+hosp_vk_hex = requests.get(f"{HOSPITAL_URL}/signing_key", **SESSION_KWARGS).json()['verify_key']
+hospital_vk = VerifyKey(hosp_vk_hex.encode('utf-8'), encoder=nacl.encoding.HexEncoder)
+
+cloud_vk_hex = requests.get(f"{CLOUD_URL}/signing_key", **SESSION_KWARGS).json()['verify_key']
+cloud_vk = VerifyKey(cloud_vk_hex.encode('utf-8'), encoder=nacl.encoding.HexEncoder)
+
+def secure_request(method, url, server_vk, **kwargs):
+    """Wraps requests.request to add mTLS args, sign POST payloads, and verify response signatures."""
+    kwargs.update(SESSION_KWARGS)
+    
+    if method == 'POST' and 'json' in kwargs:
+        payload_bytes = json.dumps(kwargs['json'], separators=(',', ':')).encode('utf-8')
+        sig_hex = clinic_signing_key.sign(payload_bytes).signature.hex()
+        
+        headers = kwargs.get('headers', {})
+        headers['X-Signature'] = sig_hex
+        headers['X-Verify-Key'] = clinic_vk_hex
+        headers['Content-Type'] = 'application/json'
+        kwargs['headers'] = headers
+        kwargs['data'] = payload_bytes
+        del kwargs['json']
+        
+    resp = requests.request(method, url, **kwargs)
+    
+    # Verify response signature if present
+    sig_hex = resp.headers.get('X-Signature')
+    if sig_hex:
+        try:
+            server_vk.verify(resp.content, bytes.fromhex(sig_hex))
+        except BadSignatureError:
+            logger.error(f"FATAL: Invalid signature from server {url}")
+            sys.exit(1)
+    elif resp.headers.get('Content-Type') == 'application/json':
+        logger.warning(f"Warning: JSON response from {url} was not signed!")
+        
+    return resp
+
 
 # Step 0: Verify Cloud integrity before trusting it with real patient data
 logger.info("Verifying Cloud integrity (decoy test)...")
 try:
-    verify_resp = requests.get(f'{HOSPITAL_URL}/verify_cloud', timeout=30)
+    verify_resp = secure_request('GET', f'{HOSPITAL_URL}/verify_cloud', hospital_vk, timeout=30)
     verify_result = verify_resp.json()
     if verify_result.get('verified'):
         logger.info(f"CLOUD INTEGRITY: VERIFIED (Decoy test: expected={verify_result['expected']}, received={verify_result['received']})")
@@ -31,7 +89,7 @@ except Exception as e:
 
 # 1. Retrieve Model & Bucket Metadata from Hospital
 logger.info("Fetching model metadata from Hospital...")
-info_resp = requests.get(f"{HOSPITAL_URL}/get_model_info").json()
+info_resp = secure_request('GET', f"{HOSPITAL_URL}/get_model_info", hospital_vk).json()
 cancer_name = info_resp["cancer_name"]
 active_features_count = info_resp["active_features_count"]
 active_indices = info_resp["active_indices"]
@@ -52,7 +110,7 @@ extended_patient = extend_patient_vector(padded_patient)
 
 # 3. Fetch Delegated Encryption Key (ek)
 logger.info("Fetching Delegated Encryption Key (ek)...")
-ek_resp = requests.get(f"{HOSPITAL_URL}/get_ek").json()
+ek_resp = secure_request('GET', f"{HOSPITAL_URL}/get_ek", hospital_vk).json()
 ek = deserialize_ek(ek_resp["ek"])
 
 # 4. Encrypt Extended Vector
@@ -61,14 +119,14 @@ json_ct = delegated_encrypt(ek, extended_patient)
 
 # 5. Fetch Sealed Functional Key & Pathway Keys
 logger.info("Fetching sealed functional key from Hospital...")
-key_resp = requests.get(f"{HOSPITAL_URL}/get_key").json()
+key_resp = secure_request('GET', f"{HOSPITAL_URL}/get_key", hospital_vk).json()
 if "error" in key_resp:
     logger.error(f"Hospital returned an error: {key_resp['error']}")
     exit(1)
 json_sk = key_resp["functional_key"]
 
 logger.info("Fetching pathway-specific functional keys for XAI...")
-pathway_keys_resp = requests.get(f'{HOSPITAL_URL}/get_pathway_keys')
+pathway_keys_resp = secure_request('GET', f'{HOSPITAL_URL}/get_pathway_keys', hospital_vk)
 if pathway_keys_resp.status_code == 429:
     budget_info = pathway_keys_resp.json()
     logger.warning("XAI PRIVACY BUDGET EXHAUSTED")
@@ -78,14 +136,25 @@ else:
     pathway_keys = pathway_keys_resp.json().get('pathway_keys', {})
 
 # 6. Evaluate Single Query
-logger.info("Dispatching single evaluation to Cloud...")
-single_payload = {"ciphertext": json_ct, "functional_key": json_sk}
-cloud_resp = requests.post(f"{CLOUD_URL}/evaluate", json=single_payload).json()
+# --- Replay Attack Prevention (Item #19) ---
+# Each query gets a unique ID and a timestamp so the Cloud can:
+#   (a) reject duplicate query_ids (replay of the exact same request), and
+#   (b) reject requests older than MAX_AGE_SECONDS (prevents storing & replaying later)
+query_id = str(uuid.uuid4())
+query_timestamp = int(time.time())
+logger.info(f"Dispatching single evaluation to Cloud (query_id={query_id})...")
+single_payload = {
+    "ciphertext": json_ct,
+    "functional_key": json_sk,
+    "query_id": query_id,
+    "timestamp": query_timestamp,
+}
+cloud_resp = secure_request('POST', f"{CLOUD_URL}/evaluate", cloud_vk, json=single_payload).json()
 
 logger.info("Fetching weight shift and rho unblinding parameter from Hospital...")
-shift_resp = requests.get(f"{HOSPITAL_URL}/get_weight_shift").json()
+shift_resp = secure_request('GET', f"{HOSPITAL_URL}/get_weight_shift", hospital_vk).json()
 weight_shift = shift_resp["weight_shift"]
-rho_resp = requests.get(f"{HOSPITAL_URL}/get_rho").json()
+rho_resp = secure_request('GET', f"{HOSPITAL_URL}/get_rho", hospital_vk).json()
 rho_val = rho_resp["rho"]
 
 raw_result = cloud_resp.get("encrypted_result")
@@ -132,11 +201,13 @@ print(f"  Weight Shift Correction   :  -{correction} (C={weight_shift})")
 # 7. Pathway Evaluation (XAI)
 if pathway_keys:
     logger.info(f"Sending {len(pathway_keys)} pathway keys to Cloud for XAI evaluation...")
-    pathway_payload = {
-        "ciphertext": json_ct,
-        "pathway_keys": pathway_keys
+    pathway_payload = { 
+        "ciphertext": json_ct, 
+        "pathway_keys": pathway_keys,
+        "query_id": query_id,
+        "timestamp": query_timestamp
     }
-    pathway_response = requests.post(f'{CLOUD_URL}/evaluate_pathways', json=pathway_payload)
+    pathway_response = secure_request('POST', f'{CLOUD_URL}/evaluate_pathways', cloud_vk, json=pathway_payload)
     pathway_raw_results = pathway_response.json()['pathway_results']
     
     pathway_scores = {}
@@ -192,7 +263,7 @@ if pathway_keys:
     print("  PRIVACY BUDGET")
     print("-" * 70)
     try:
-        budget_resp = requests.get(f'{HOSPITAL_URL}/xai_privacy_budget').json()
+        budget_resp = secure_request('GET', f'{HOSPITAL_URL}/xai_privacy_budget', hospital_vk).json()
         remaining = budget_resp.get('remaining', 0)
         total = budget_resp.get('total_budget', 0)
         queries = budget_resp.get('queries_made', 0)
@@ -213,7 +284,9 @@ if pathway_keys:
 # 8. Test Parallel Batch Endpoint
 logger.info("Testing /evaluate_batch endpoint with duplicate parallel payload...")
 batch_payload = build_batch_payload([json_ct, json_ct], [json_sk, json_sk])
-batch_resp = requests.post(f"{CLOUD_URL}/evaluate_batch", json=batch_payload).json()
+batch_payload["query_id"] = str(uuid.uuid4())
+batch_payload["timestamp"] = int(time.time())
+batch_resp = secure_request('POST', f"{CLOUD_URL}/evaluate_batch", cloud_vk, json=batch_payload).json()
 raw_batch_results = batch_resp.get("results", [])
 true_batch_results = [correct_blinded_result(res, rho_val) - correction for res in raw_batch_results]
 logger.info(f"Batch Parallel Results (True): {true_batch_results}")
@@ -231,7 +304,7 @@ else:
 # 9. Verify audit chain integrity
 logger.info("Verifying audit chain integrity...")
 try:
-    chain_resp = requests.get(f'{CLOUD_URL}/verify_audit_chain')
+    chain_resp = secure_request('GET', f'{CLOUD_URL}/verify_audit_chain', cloud_vk)
     chain_result = chain_resp.json()
     print("-" * 70)
     print("  MERKLE AUDIT CHAIN")
