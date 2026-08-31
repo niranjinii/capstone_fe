@@ -78,57 +78,134 @@ class MerkleAuditLog:
         return {'entries': self.entries, 'merkle_root': self.merkle_root,
                 'total_evaluations': len(self.entries)}
 
-def run_decoy_verification(cloud_url, master_key, quantized_weights, weight_shift):
+def run_decoy_verification(
+    cloud_url,
+    master_key,
+    quantized_weights,
+    weight_shift,
+    cert=None,
+    verify=True,
+    signing_key=None
+):
     from mife.single.fhiding.ddh import FeDDH
     from fhipe_serializer import serialize_ciphertext, serialize_functional_key
-    
+    from nacl.public import PublicKey, SealedBox
+    from nacl.signing import VerifyKey
+    import nacl.encoding
+    import base64
+    import uuid
+
     n = len(quantized_weights)
-    
+
     # 1. Create a random dummy patient vector
-    # Using small numbers to avoid overflow, just testing the math
     dummy_x = [random.randint(0, 5) for _ in range(n)]
-    
-    # 2. Compute the expected cleartext dot product
-    expected_dot = sum(x * w for x, w in zip(dummy_x, quantized_weights))
-    expected_result = expected_dot
-    
-    # 3. Encrypt the dummy vector locally using the master key directly
-    # (Hospital owns the master key, so it doesn't need to use delegated crypto here)
+
+    # 2. Compute expected cleartext dot product
+    expected_result = sum(
+        x * w for x, w in zip(dummy_x, quantized_weights)
+    )
+
+    # 3. Encrypt dummy vector using Hospital's master key
     ciphertext = FeDDH.encrypt(dummy_x, master_key)
     serialized_ct = serialize_ciphertext(ciphertext)
-    
-    # 4. Generate the functional key
+
+    # 4. Generate functional key
     functional_key = FeDDH.keygen(quantized_weights, master_key)
     json_sk = serialize_functional_key(functional_key)
-    
-    # Fetch Cloud public key and seal the functional key
-    from nacl.public import PublicKey, SealedBox
-    import base64
-    cloud_resp = requests.get(f"{cloud_url}/public_key").json()
-    cloud_pk_bytes = base64.b64decode(cloud_resp['public_key'])
+
+    # 5. Fetch Cloud public encryption key using mTLS
+    cloud_resp = requests.get(
+        f"{cloud_url}/public_key",
+        cert=cert,
+        verify=verify
+    )
+    cloud_resp.raise_for_status()
+    cloud_pk_bytes = base64.b64decode(cloud_resp.json()["public_key"])
+
     cloud_pk = PublicKey(cloud_pk_bytes)
-    
     sealed_box = SealedBox(cloud_pk)
-    encrypted_sk = sealed_box.encrypt(json_sk.encode('utf-8'))
-    sealed_functional_key = base64.b64encode(encrypted_sk).decode('utf-8')
-    
-    # 5. Send to Cloud
+
+    # Seal the functional key for Cloud
+    encrypted_sk = sealed_box.encrypt(json_sk.encode("utf-8"))
+    sealed_functional_key = base64.b64encode(encrypted_sk).decode("utf-8")
+
+    # 6. Build a normal Cloud evaluation payload
     payload = {
         "ciphertext": serialized_ct,
-        "functional_key": sealed_functional_key
+        "functional_key": sealed_functional_key,
+        "query_id": str(uuid.uuid4()),
+        "timestamp": int(time.time())
     }
-    
+
+    # Cloud requires Ed25519 signature on POST payloads
+    if signing_key is None:
+        return {
+            "verified": False,
+            "error": "Hospital signing key was not provided"
+        }
+
+    payload_bytes = json.dumps(
+        payload,
+        separators=(",", ":")
+    ).encode("utf-8")
+
+    signature = signing_key.sign(payload_bytes).signature.hex()
+
+    headers = {
+        "X-Signature": signature,
+        "X-Verify-Key": signing_key.verify_key.encode(
+            encoder=nacl.encoding.HexEncoder
+        ).decode("utf-8"),
+        "Content-Type": "application/json"
+    }
+
+    # 7. Send signed + mTLS-protected request to Cloud
     try:
-        response = requests.post(f"{cloud_url}/evaluate", json=payload)
+        response = requests.post(
+            f"{cloud_url}/evaluate",
+            data=payload_bytes,
+            headers=headers,
+            cert=cert,
+            verify=verify
+        )
         response.raise_for_status()
+
+        # 8. Verify Cloud's Ed25519 response signature
+        response_sig = response.headers.get("X-Signature")
+        if not response_sig:
+            return {
+                "verified": False,
+                "error": "Cloud response was not signed"
+            }
+
+        cloud_signing_resp = requests.get(
+            f"{cloud_url}/signing_key",
+            cert=cert,
+            verify=verify
+        )
+        cloud_signing_resp.raise_for_status()
+
+        cloud_vk_hex = cloud_signing_resp.json()["verify_key"]
+        cloud_vk = VerifyKey(
+            cloud_vk_hex.encode("utf-8"),
+            encoder=nacl.encoding.HexEncoder
+        )
+
+        cloud_vk.verify(
+            response.content,
+            bytes.fromhex(response_sig)
+        )
+
+        # 9. Compare Cloud's result with independently calculated result
         cloud_result = response.json().get("encrypted_result")
-        
         verified = (cloud_result == expected_result)
+
         return {
             "verified": verified,
             "expected": expected_result,
             "received": cloud_result
         }
+
     except Exception as e:
         return {
             "verified": False,

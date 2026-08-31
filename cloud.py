@@ -2,6 +2,8 @@ import base64
 import multiprocessing
 import traceback
 import logging
+import time
+import ssl
 from concurrent.futures import ProcessPoolExecutor
 from flask import Flask, request, jsonify
 
@@ -9,6 +11,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(name)s] %(level
 logger = logging.getLogger("Cloud")
 from mife.single.fhiding.ddh import FeDDH
 from nacl.public import PrivateKey, SealedBox
+from nacl.signing import SigningKey, VerifyKey
+import nacl.encoding
+from nacl.exceptions import BadSignatureError
 
 from fhipe_serializer import deserialize_ciphertext, deserialize_functional_key
 from mcl_backend import MclPairing
@@ -36,6 +41,76 @@ print("[XAI] Audit chain initialized.")
 # 1. Cloud generates its long-term X25519 keypair on boot
 cloud_private_key = PrivateKey.generate()
 cloud_public_key = cloud_private_key.public_key
+
+# --- Payload Signing Key (Item #7) ---
+cloud_signing_key = SigningKey.generate()
+cloud_verify_key = cloud_signing_key.verify_key
+
+@app.route('/signing_key', methods=['GET'])
+def get_signing_key():
+    """Expose the Cloud's Ed25519 verify key so the Clinic can verify responses."""
+    vk_hex = cloud_verify_key.encode(encoder=nacl.encoding.HexEncoder).decode('utf-8')
+    return jsonify({"verify_key": vk_hex})
+
+@app.before_request
+def verify_incoming_payload():
+    """Verify Ed25519 signature on all incoming POST JSON payloads."""
+    if request.method == 'POST' and request.is_json:
+        sig_hex = request.headers.get('X-Signature')
+        vk_hex = request.headers.get('X-Verify-Key')
+        
+        if not sig_hex or not vk_hex:
+            logger.warning("Rejected payload: missing signature headers")
+            return jsonify({"error": "Missing signature headers"}), 403
+            
+        try:
+            vk = VerifyKey(vk_hex.encode('utf-8'), encoder=nacl.encoding.HexEncoder)
+            sig_bytes = bytes.fromhex(sig_hex)
+            payload_bytes = request.get_data()
+            vk.verify(payload_bytes, sig_bytes)
+        except BadSignatureError:
+            logger.error("Rejected payload: invalid signature!")
+            return jsonify({"error": "Invalid signature"}), 403
+        except Exception as e:
+            return jsonify({"error": f"Signature verification failed: {str(e)}"}), 403
+
+@app.after_request
+def sign_outgoing_payload(response):
+    """Sign all outgoing JSON responses with the Cloud's Ed25519 signing key."""
+    if response.is_json:
+        payload_bytes = response.get_data()
+        signature = cloud_signing_key.sign(payload_bytes).signature
+        response.headers['X-Signature'] = signature.hex()
+    return response
+
+# --- Replay Attack Prevention State (Item #19) ---
+# seen_queries: set of query_ids that have already been processed.
+# Memory is bounded because we only store the UUID string (~36 bytes each).
+# In production you'd prune entries older than MAX_AGE_SECONDS, but for the
+# demo the set stays small enough that no pruning is needed.
+seen_queries = set()
+MAX_AGE_SECONDS = 300  # reject payloads older than 5 minutes
+
+def validate_query(data: dict):
+    """Check for replay attacks.
+    Returns (valid: bool, reason: str).
+    """
+    qid = data.get('query_id')
+    ts  = data.get('timestamp', 0)
+
+    if not qid:
+        # Backwards-compatible: if no query_id, skip replay check (old clients)
+        return True, "no query_id present — skipping replay check"
+
+    if qid in seen_queries:
+        return False, f"Duplicate query_id '{qid}' — possible replay attack"
+
+    age = abs(time.time() - ts)
+    if age > MAX_AGE_SECONDS:
+        return False, f"Query timestamp too old ({age:.0f}s > {MAX_AGE_SECONDS}s) — possible replay attack"
+
+    seen_queries.add(qid)
+    return True, "OK"
 
 def decrypt_single_evaluation(eval_item: dict, private_key: PrivateKey) -> int:
     sealed_box = SealedBox(private_key)
@@ -67,6 +142,14 @@ def evaluate():
     logger.info("Received POST /evaluate request.")
     try:
         data = request.json
+
+        # --- Replay Attack Prevention (Item #19) ---
+        valid, reason = validate_query(data)
+        if not valid:
+            logger.warning(f"[REPLAY BLOCKED] {reason}")
+            return jsonify({"error": reason}), 403
+        logger.info(f"[REPLAY CHECK] OK — query_id={data.get('query_id')}")
+
         result = decrypt_single_evaluation(data, cloud_private_key)
         logger.info("Single evaluation complete.")
 
@@ -143,4 +226,10 @@ def evaluate_batch():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(port=5002)
+    # --- mTLS (Task 5, Item #7) ---
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain('cloud.pem', 'cloud-key.pem')
+    context.load_verify_locations('ca.pem')
+    context.verify_mode = ssl.CERT_REQUIRED  # mTLS: reject clients without a valid cert
+    print("[mTLS] Cloud starting with mutual TLS on port 5002...")
+    app.run(port=5002, ssl_context=context)
