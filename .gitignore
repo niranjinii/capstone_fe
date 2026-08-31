@@ -1,3 +1,5 @@
 /__pycache__
 /.
 EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena
+venv/
+audit_chain.json
