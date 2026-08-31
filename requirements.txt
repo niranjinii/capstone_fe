@@ -1,0 +1,11 @@
+numpy
+pandas
+scipy
+scikit-learn
+py_ecc
+matplotlib
+requests
+flask
+pymife
+mclbn256
+PyNaCl
