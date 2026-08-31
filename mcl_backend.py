@@ -3,21 +3,15 @@ import random
 from mife.data.pairing import PairingBase
 from mife.data.group import GroupElem
 
-# The true prime order of the mclbn256 BN curve.
-# This differs from Ethereum's BN128 order — using the wrong value here
-# breaks matrix inversion in FeDDH keygen and corrupts all scalar multiplications.
 MCL_CURVE_ORDER = 16798108731015832284940804142231733909759579603404752749028378864165570215949
 
 def _to_fr(scalar: int):
     """Safely converts a python int to mclbn256.Fr"""
     fr = mclbn256.Fr()
-    # The true order of mclbn256 curve
-    ORDER = 16798108731015832284940804142231733909759579603404752749028378864165570215949
-    pos_scalar = scalar % ORDER
+    pos_scalar = scalar % MCL_CURVE_ORDER
     hex_scalar = hex(pos_scalar)[2:]
     hex_bytes = hex_scalar.encode()
     
-    # Do NOT use setInt here, as Python ctypes silently truncates large numbers to 64-bit!
     methods_to_try = [
         lambda: fr.fromstr(hex_bytes, 16),
         lambda: fr.fromstr(hex_scalar, 16),
@@ -30,81 +24,132 @@ def _to_fr(scalar: int):
             return fr
         except Exception:
             continue
-    # If all fail, try to initialize it directly
     try:
         return mclbn256.Fr(pos_scalar)
     except Exception:
         return mclbn256.Fr(hex_scalar)
 
+
 class MclG1Wrapper(GroupElem):
-    def __init__(self, val: mclbn256.G1):
+    def __init__(self, val=None):
         self.val = val
 
+    @property
+    def inner(self):
+        # Safely extracts without triggering the 'None' getattr trap
+        if hasattr(self, 'val') and self.val is not None:
+            return self.val
+        if hasattr(self, 'point') and self.point is not None:
+            return self.point
+        return None
+
     def __add__(self, other):
-        return MclG1Wrapper(self.val + other.val)
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import add
+            return MclG1Wrapper(add(self.inner, other.inner))
+        return MclG1Wrapper(self.inner + other.inner)
 
     def __neg__(self):
-        return MclG1Wrapper(-self.val)
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import neg
+            return MclG1Wrapper(neg(self.inner))
+        return MclG1Wrapper(-self.inner)
 
     def __rmul__(self, scalar: int):
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import multiply
+            return MclG1Wrapper(multiply(self.inner, int(scalar)))
         fr = _to_fr(scalar)
-        return MclG1Wrapper(self.val * fr)
+        return MclG1Wrapper(self.inner * fr)
 
     def __eq__(self, other):
-        return self.val.serialize() == other.val.serialize()
+        if isinstance(self.inner, tuple):
+            return self.inner == other.inner
+        return self.inner.serialize() == other.inner.serialize()
 
     def __hash__(self):
-        return hash(self.val.serialize())
+        if isinstance(self.inner, tuple):
+            return hash(str(self.inner))
+        return hash(self.inner.serialize())
 
     def export(self) -> dict:
         pass
 
 
 class MclG2Wrapper(GroupElem):
-    def __init__(self, val: mclbn256.G2):
+    def __init__(self, val=None):
         self.val = val
 
+    @property
+    def inner(self):
+        if hasattr(self, 'val') and self.val is not None:
+            return self.val
+        if hasattr(self, 'point') and self.point is not None:
+            return self.point
+        return None
+
     def __add__(self, other):
-        return MclG2Wrapper(self.val + other.val)
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import add
+            return MclG2Wrapper(add(self.inner, other.inner))
+        return MclG2Wrapper(self.inner + other.inner)
 
     def __neg__(self):
-        return MclG2Wrapper(-self.val)
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import neg
+            return MclG2Wrapper(neg(self.inner))
+        return MclG2Wrapper(-self.inner)
 
     def __rmul__(self, scalar: int):
+        if isinstance(self.inner, tuple):
+            from py_ecc.bn128 import multiply
+            return MclG2Wrapper(multiply(self.inner, int(scalar)))
         fr = _to_fr(scalar)
-        return MclG2Wrapper(self.val * fr)
+        return MclG2Wrapper(self.inner * fr)
 
     def __eq__(self, other):
-        return self.val.serialize() == other.val.serialize()
+        if isinstance(self.inner, tuple):
+            return self.inner == other.inner
+        return self.inner.serialize() == other.inner.serialize()
 
     def __hash__(self):
-        return hash(self.val.serialize())
+        if isinstance(self.inner, tuple):
+            return hash(str(self.inner))
+        return hash(self.inner.serialize())
 
     def export(self) -> dict:
         pass
 
 
 class MclGTWrapper(GroupElem):
-    def __init__(self, val: mclbn256.GT):
+    def __init__(self, val=None):
         self.val = val
 
+    @property
+    def inner(self):
+        if hasattr(self, 'val') and self.val is not None:
+            return self.val
+        if hasattr(self, 'point') and self.point is not None:
+            return self.point
+        return None
+
     def __add__(self, other):
-        return MclGTWrapper(self.val * other.val)
+        return MclGTWrapper(self.inner * other.inner)
 
     def __neg__(self):
         inv = mclbn256.GT()
-        mclbn256.mclbn256.GT_inv(inv, self.val)
+        mclbn256.mclbn256.GT_inv(inv, self.inner)
         return MclGTWrapper(inv)
 
     def __rmul__(self, scalar: int):
         fr = _to_fr(scalar)
-        return MclGTWrapper(self.val ** fr)
+        return MclGTWrapper(self.inner ** fr)
 
     def __eq__(self, other):
-        return self.val.serialize() == other.val.serialize()
+        return self.inner.serialize() == other.inner.serialize()
 
     def __hash__(self):
-        return hash(self.val.serialize())
+        return hash(self.inner.serialize())
 
     def export(self) -> dict:
         pass
@@ -121,8 +166,7 @@ class MclPairing(PairingBase):
         self._identity_t = None
 
     def order(self) -> int:
-        # True prime order for the mclbn256 BN curve (this differs from Ethereum BN128)
-        return 16798108731015832284940804142231733909759579603404752749028378864165570215949
+        return MCL_CURVE_ORDER
 
     def generator1(self) -> MclG1Wrapper:
         return MclG1Wrapper(self._g1)
@@ -145,24 +189,20 @@ class MclPairing(PairingBase):
 
     def identityT(self) -> MclGTWrapper:
         if self._identity_t is None:
-            g = mclbn256.GT()
-            g.clear()
+            g1 = mclbn256.G1()
+            g1.clear()
+            g2 = mclbn256.G2()
+            g2.clear()
+            g = g1.pairing(g2)
             self._identity_t = MclGTWrapper(g)
         return self._identity_t
 
     def pairing(self, g1: MclG1Wrapper, g2: MclG2Wrapper) -> MclGTWrapper:
-        gt = g1.val.pairing(g2.val)
+        gt = g1.inner.pairing(g2.inner)
         return MclGTWrapper(gt)
 
 
 def fast_feddh_generate(n: int, F=None):
-    """
-    Optimized FeDDH key generation that bypasses pymife's slow ZmodR matrix objects.
-    Does Gaussian elimination using raw Python ints (using Python's fast built-in
-    modular inverse), then wraps the result back into pymife-compatible objects.
-
-    Reduces keygen from ~7 minutes to ~20 seconds for n=300.
-    """
     from mife.single.fhiding.ddh import _FeDDH_MK, _FeDDH_MSK
     from mife.data.zmod_r import ZmodR
     from mife.data.matrix import Matrix
