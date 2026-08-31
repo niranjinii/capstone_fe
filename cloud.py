@@ -169,6 +169,14 @@ def evaluate():
 def evaluate_pathways():
     try:
         data = request.json
+
+        # Replay check
+        valid, reason = validate_query(data)
+        if not valid:
+            logger.warning(f"[REPLAY BLOCKED] {reason}")
+            return jsonify({"error": reason}), 403
+
+        logger.info(f"[REPLAY CHECK] OK — query_id={data.get('query_id')}")
         ct_json = data['ciphertext']
         pathway_keys = data['pathway_keys']
 
@@ -181,6 +189,11 @@ def evaluate_pathways():
             # Add calibrated Laplace noise for epsilon-differential privacy
             noise = int(np.random.laplace(0, XAI_SENSITIVITY / XAI_EPSILON))
             results[name] = raw_score + noise
+        
+        # Audit log
+        query_id = data.get('query_id', str(uuid.uuid4()))
+        ct_hash = hashlib.sha256(ct_json.encode('utf-8')).hexdigest()
+        audit_chain.log_evaluation(query_id, ct_hash, results)
 
         return jsonify({
             "pathway_results": results,
@@ -206,6 +219,14 @@ def evaluate_batch():
     logger.info("Received POST /evaluate_batch request.")
     try:
         data = request.json
+
+        # Replay check
+        valid, reason = validate_query(data)
+        if not valid:
+            logger.warning(f"[REPLAY BLOCKED] {reason}")
+            return jsonify({"error": reason}), 403
+        logger.info(f"[REPLAY CHECK] OK — query_id={data.get('query_id')}")
+        
         items = data.get("evaluations", [])
         if not items:
             logger.warning("No evaluation items provided in batch request.")
@@ -218,6 +239,13 @@ def evaluate_batch():
         with ProcessPoolExecutor(max_workers=min(len(items), 8)) as executor:
             results = list(executor.map(_worker_wrapper, worker_args))
             
+        # Audit log
+        query_id = data.get('query_id', str(uuid.uuid4()))
+        for item, result in zip(items, results):
+            ct_json = item['ciphertext']
+            ct_hash = hashlib.sha256(ct_json.encode('utf-8')).hexdigest()
+            audit_chain.log_evaluation(query_id, ct_hash, result)
+
         logger.info("Batch evaluation complete.")
         return jsonify({"results": results})
     except Exception as e:

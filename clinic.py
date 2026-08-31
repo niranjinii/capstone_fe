@@ -201,9 +201,11 @@ print(f"  Weight Shift Correction   :  -{correction} (C={weight_shift})")
 # 7. Pathway Evaluation (XAI)
 if pathway_keys:
     logger.info(f"Sending {len(pathway_keys)} pathway keys to Cloud for XAI evaluation...")
-    pathway_payload = {
-        "ciphertext": json_ct,
-        "pathway_keys": pathway_keys
+    pathway_payload = { 
+        "ciphertext": json_ct, 
+        "pathway_keys": pathway_keys,
+        "query_id": query_id,
+        "timestamp": query_timestamp
     }
     pathway_response = secure_request('POST', f'{CLOUD_URL}/evaluate_pathways', cloud_vk, json=pathway_payload)
     pathway_raw_results = pathway_response.json()['pathway_results']
@@ -282,6 +284,8 @@ if pathway_keys:
 # 8. Test Parallel Batch Endpoint
 logger.info("Testing /evaluate_batch endpoint with duplicate parallel payload...")
 batch_payload = build_batch_payload([json_ct, json_ct], [json_sk, json_sk])
+batch_payload["query_id"] = str(uuid.uuid4())
+batch_payload["timestamp"] = int(time.time())
 batch_resp = secure_request('POST', f"{CLOUD_URL}/evaluate_batch", cloud_vk, json=batch_payload).json()
 raw_batch_results = batch_resp.get("results", [])
 true_batch_results = [correct_blinded_result(res, rho_val) - correction for res in raw_batch_results]
