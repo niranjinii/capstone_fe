@@ -4,6 +4,14 @@ import uuid
 import time
 import numpy as np
 import requests
+import urllib3
+import argparse
+import hashlib
+from patient_store import TCGAPatientStore
+
+TCGA_DIR = r"C:\Users\nidhi\OneDrive\College\Capstone\TCGA-PANCAN-HiSeq-801x20531"
+
+urllib3.disable_warnings()
 import json
 import logging
 from nacl.signing import SigningKey, VerifyKey
@@ -18,6 +26,19 @@ logger = logging.getLogger("Clinic")
 
 logger.info("--- Starting Clinic Inference Workflow (XAI & Security Edition) ---")
 
+parser = argparse.ArgumentParser(description="Clinic Inference Client")
+parser.add_argument("--patient-id", required=True,
+                    help="Patient ID from TCGA dataset, e.g. 'sample_0'")
+parser.add_argument("--doctor-id", required=True,
+                    help="Registered doctor ID, e.g. 'dr_alice'")
+parser.add_argument("--doctor-key", required=True,
+                    help="Path to doctor's Ed25519 private key file")
+args, _ = parser.parse_known_args()
+
+from nacl.signing import SigningKey as DoctorSigningKey
+with open(args.doctor_key, "rb") as f:
+    doctor_signing_key = DoctorSigningKey(f.read())
+
 HOSPITAL_URL = 'https://127.0.0.1:5001'
 CLOUD_URL    = 'https://127.0.0.1:5002'
 
@@ -27,7 +48,7 @@ CLOUD_URL    = 'https://127.0.0.1:5002'
 #   verify= tells requests to validate the server cert against our private CA
 SESSION_KWARGS = {
     'cert':   ('clinic.pem', 'clinic-key.pem'),
-    'verify': 'ca.pem',
+    'verify': False,
 }
 
 # --- Payload Signing (Task 6, Item #7) ---
@@ -44,18 +65,31 @@ cloud_vk = VerifyKey(cloud_vk_hex.encode('utf-8'), encoder=nacl.encoding.HexEnco
 def secure_request(method, url, server_vk, **kwargs):
     """Wraps requests.request to add mTLS args, sign POST payloads, and verify response signatures."""
     kwargs.update(SESSION_KWARGS)
+    headers = kwargs.get('headers', {})
+
+    # --- Doctor auth headers (🛡️ replay-resistant) ---
+    from urllib.parse import urlparse
+    path = urlparse(url).path
+    doc_nonce = str(uuid.uuid4())
+    doc_timestamp = str(int(time.time()))
+    doc_sig_payload = f"{method}|{path}|{doc_timestamp}|{doc_nonce}".encode()
+    headers["X-Doctor-ID"] = args.doctor_id
+    headers["X-Doctor-Timestamp"] = doc_timestamp
+    headers["X-Doctor-Nonce"] = doc_nonce
+    headers["X-Doctor-Signature"] = doctor_signing_key.sign(doc_sig_payload).signature.hex()
     
     if method == 'POST' and 'json' in kwargs:
         payload_bytes = json.dumps(kwargs['json'], separators=(',', ':')).encode('utf-8')
         sig_hex = clinic_signing_key.sign(payload_bytes).signature.hex()
         
-        headers = kwargs.get('headers', {})
         headers['X-Signature'] = sig_hex
         headers['X-Verify-Key'] = clinic_vk_hex
         headers['Content-Type'] = 'application/json'
         kwargs['headers'] = headers
         kwargs['data'] = payload_bytes
         del kwargs['json']
+    else:
+        kwargs['headers'] = headers
         
     resp = requests.request(method, url, **kwargs)
     
@@ -99,8 +133,16 @@ bucket_dim = info_resp["bucket_dimension"]
 logger.info(f"Target: {cancer_name} | Bucket: '{bucket_name}' (Dimension: {bucket_dim})")
 
 # 2. Load & Pad Real Patient Expression Vector
-logger.info("Loading real patient data from 'patient1_full.npy'...")
-full_patient = np.load("patient1_full.npy")
+# --- Dynamic Patient Loading via PatientStore ---
+store = TCGAPatientStore(TCGA_DIR)
+if not store.patient_exists(args.patient_id):
+    logger.error(f"Unknown patient ID: {args.patient_id!r}")
+    sys.exit(1)
+full_patient = store.get_patient_vector(args.patient_id)
+known_label = store.get_patient_label(args.patient_id)
+patient_id_hash = hashlib.sha256(args.patient_id.encode()).hexdigest()[:16]
+logger.info(f"Loaded patient [{patient_id_hash}...] (dataset label: {known_label})")
+
 raw_patient = full_patient[active_indices]
 
 SCALING_FACTOR = 5.0
@@ -146,7 +188,7 @@ logger.info(f"Dispatching single evaluation to Cloud (query_id={query_id})...")
 single_payload = {
     "ciphertext": json_ct,
     "functional_key": json_sk,
-    "query_id": query_id,
+    "query_id": str(query_id) + "-xai",
     "timestamp": query_timestamp,
 }
 cloud_resp = secure_request('POST', f"{CLOUD_URL}/evaluate", cloud_vk, json=single_payload).json()
@@ -191,6 +233,8 @@ print(f"  Risk Level   :  {risk_probability:.2f}%")
 risk_bar_len = int(risk_probability / 2)
 risk_bar = "#" * risk_bar_len + "-" * (50 - risk_bar_len)
 print(f"  Risk Bar     :  [{risk_bar}]")
+if known_label:
+    print(f"  Dataset Label  :  {known_label}  (TCGA ground truth — not the model's prediction)")
 print("-" * 70)
 print("  SECURITY CHECKS")
 print("-" * 70)
@@ -204,8 +248,8 @@ if pathway_keys:
     pathway_payload = { 
         "ciphertext": json_ct, 
         "pathway_keys": pathway_keys,
-        "query_id": query_id,
-        "timestamp": query_timestamp
+        "query_id": str(uuid.uuid4()),
+        "timestamp": int(time.time())
     }
     pathway_response = secure_request('POST', f'{CLOUD_URL}/evaluate_pathways', cloud_vk, json=pathway_payload)
     pathway_raw_results = pathway_response.json()['pathway_results']
@@ -263,7 +307,7 @@ if pathway_keys:
     print("  PRIVACY BUDGET")
     print("-" * 70)
     try:
-        budget_resp = secure_request('GET', f'{HOSPITAL_URL}/xai_privacy_budget', hospital_vk).json()
+        budget_resp = secure_request('GET', f'{HOSPITAL_URL}/doctor_budget', hospital_vk).json()
         remaining = budget_resp.get('remaining', 0)
         total = budget_resp.get('total_budget', 0)
         queries = budget_resp.get('queries_made', 0)
@@ -323,3 +367,6 @@ except Exception as e:
 print("=" * 70)
 print("                       END OF REPORT")
 print("=" * 70)
+
+import os
+os._exit(0)

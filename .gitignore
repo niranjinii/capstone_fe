@@ -3,3 +3,11 @@
 EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena
 venv/
 audit_chain.json
+*.key
+*.pem
+*.pub
+*.patch
+patch*.py
+doctor_registry.json
+hospital_state.json
+patient1_full.npy

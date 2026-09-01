@@ -267,4 +267,10 @@ if __name__ == "__main__":
     context.load_verify_locations('ca.pem')
     context.verify_mode = ssl.CERT_REQUIRED  # mTLS: reject clients without a valid cert
     print("[mTLS] Cloud starting with mutual TLS on port 5002...")
-    app.run(port=5002, ssl_context=context)
+    try:
+        app.run(port=5002, ssl_context=context)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        import os
+        os._exit(0)
