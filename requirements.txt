@@ -10,3 +10,4 @@ pymife
 mclbn256
 PyNaCl
 cryptography
+pytest
