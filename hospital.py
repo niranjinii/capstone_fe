@@ -1,7 +1,10 @@
 import argparse
 import base64
 import traceback
-import time
+import threading
+import json
+import os
+import uuid
 import ssl
 from collections import defaultdict
 import numpy as np
@@ -19,7 +22,7 @@ from fhipe_serializer import serialize_functional_key
 from delegated_crypto import generate_ek, serialize_ek
 from bucketing import get_cancer_type_name, get_bucket_info, pad_weights
 from mcl_backend import MclPairing, fast_feddh_generate
-import time as _time
+import time
 from pathway_xai import load_hallmark_pathways, build_pathway_vectors
 from audit_log import run_decoy_verification
 from rho_blinding import generate_rho, extend_weight_vector
@@ -30,7 +33,15 @@ logger = logging.getLogger("Hospital")
 app = Flask(__name__)
 
 # --- Payload Signing Key (Item #7, Member C) ---
-hospital_signing_key = SigningKey.generate()
+SIGNING_KEY_FILE = "hospital_signing.key"
+if os.path.exists(SIGNING_KEY_FILE):
+    with open(SIGNING_KEY_FILE, "rb") as f:
+        hospital_signing_key = SigningKey(f.read())
+else:
+    hospital_signing_key = SigningKey.generate()
+    with open(SIGNING_KEY_FILE, "wb") as f:
+        f.write(hospital_signing_key.encode())
+        
 hospital_verify_key = hospital_signing_key.verify_key
 
 @app.route('/signing_key', methods=['GET'])
@@ -152,37 +163,109 @@ XAI_TOTAL_BUDGET = 10.0
 xai_budget_spent = 0.0
 xai_query_log = []
 
-def check_xai_budget(request_ip):
-    global xai_budget_spent
-    remaining = XAI_TOTAL_BUDGET - xai_budget_spent
-    if remaining < XAI_EPSILON_PER_QUERY:
-        return False, remaining
-    return True, remaining
+# WARNING: This lock only synchronizes threads within a single process.
+# If deployed via gunicorn with multiple workers (e.g., -w 4), this state is not shared,
+# and attackers get 4x the budget. A Redis backend is required for multi-process deployments.
+state_lock = threading.Lock()
+STATE_FILE = "hospital_state.json"
 
-def spend_xai_budget(request_ip):
-    global xai_budget_spent
-    xai_budget_spent += XAI_EPSILON_PER_QUERY
-    remaining = XAI_TOTAL_BUDGET - xai_budget_spent
-    xai_query_log.append({
-        'timestamp': _time.time(),
-        'ip': request_ip,
-        'epsilon_spent': XAI_EPSILON_PER_QUERY,
-        'total_spent': xai_budget_spent,
-        'remaining': remaining,
-    })
-    if remaining <= XAI_TOTAL_BUDGET * 0.25:
-        logger.warning(f"[XAI] WARNING: Privacy budget at {remaining:.1f}/{XAI_TOTAL_BUDGET} epsilon")
-    return remaining
+def _save_state():
+    state = {
+        "xai_budget_spent": xai_budget_spent,
+        "xai_query_log": xai_query_log,
+        "key_issuance_log": {str(k): v for k, v in key_issuance_log.items()}
+    }
+    state_bytes = json.dumps(state).encode("utf-8")
+    signature = hospital_signing_key.sign(state_bytes).signature.hex()
+    
+    wrapper = {
+        "signature": signature,
+        "data_hex": state_bytes.hex()
+    }
+    tmp_file = STATE_FILE + ".tmp"
+    with open(tmp_file, "w") as f:
+        json.dump(wrapper, f)
+    os.replace(tmp_file, STATE_FILE)
 
-def check_rate_limit(model_index, dimension):
-    max_allowed = max(1, dimension // 2)
-    history = key_issuance_log[model_index]
-    count = len(history)
-    if count >= max_allowed:
-        return False, f"Rate limit reached: {count}/{max_allowed} keys issued for model {model_index}"
-    if count >= int(0.75 * max_allowed):
-        logger.warning(f"Model {model_index}: {count}/{max_allowed} keys issued — approaching extraction threshold!")
-    return True, "OK"
+def _load_state():
+    global xai_budget_spent, xai_query_log, key_issuance_log
+    if not os.path.exists(STATE_FILE):
+        return
+    with open(STATE_FILE, "r") as f:
+        wrapper = json.load(f)
+    
+    data_bytes = bytes.fromhex(wrapper["data_hex"])
+    signature = bytes.fromhex(wrapper["signature"])
+    
+    # Will throw nacl.exceptions.BadSignatureError and crash if tampered
+    hospital_verify_key.verify(data_bytes, signature)
+    
+    state = json.loads(data_bytes.decode("utf-8"))
+    xai_budget_spent = state["xai_budget_spent"]
+    xai_query_log = state["xai_query_log"]
+    key_issuance_log.clear()
+    for k, v in state["key_issuance_log"].items():
+        key_issuance_log[int(k)] = v
+
+_load_state()
+
+def reserve_xai_budget(request_ip):
+    global xai_budget_spent
+    with state_lock:
+        remaining = XAI_TOTAL_BUDGET - xai_budget_spent
+        if remaining < XAI_EPSILON_PER_QUERY:
+            return False, remaining, None
+        
+        xai_budget_spent += XAI_EPSILON_PER_QUERY
+        remaining_after = XAI_TOTAL_BUDGET - xai_budget_spent
+        entry_id = str(uuid.uuid4())
+        xai_query_log.append({
+            'id': entry_id,
+            'timestamp': time.time(),
+            'ip': request_ip,
+            'epsilon_spent': XAI_EPSILON_PER_QUERY,
+            'total_spent': xai_budget_spent,
+            'remaining': remaining_after,
+        })
+        if remaining_after <= XAI_TOTAL_BUDGET * 0.25:
+            logger.warning(f"[XAI] WARNING: Privacy budget at {remaining_after:.1f}/{XAI_TOTAL_BUDGET} epsilon")
+        _save_state()
+        return True, remaining_after, entry_id
+
+def rollback_xai_budget(entry_id):
+    global xai_budget_spent, xai_query_log
+    with state_lock:
+        xai_budget_spent -= XAI_EPSILON_PER_QUERY
+        xai_query_log[:] = [e for e in xai_query_log if e.get('id') != entry_id]
+        _save_state()
+
+def reserve_key_issuance(model_index, dimension, request_ip):
+    with state_lock:
+        max_allowed = max(1, dimension // 2)
+        history = key_issuance_log[model_index]
+        count = len(history)
+        if count >= max_allowed:
+            return False, f"Rate limit reached: {count}/{max_allowed} keys issued for model {model_index}", None
+        if count >= int(0.75 * max_allowed):
+            logger.warning(f"Model {model_index}: {count}/{max_allowed} keys issued — approaching extraction threshold!")
+            
+        entry_id = str(uuid.uuid4())
+        entry = {
+            "id": entry_id,
+            "timestamp": time.time(),
+            "model_index": model_index,
+            "requester_ip": request_ip,
+            "count": count + 1,
+            "limit": max_allowed,
+        }
+        key_issuance_log[model_index].append(entry)
+        _save_state()
+        return True, "OK", entry_id
+
+def rollback_key_issuance(model_index, entry_id):
+    with state_lock:
+        key_issuance_log[model_index] = [e for e in key_issuance_log[model_index] if e.get('id') != entry_id]
+        _save_state()
 
 @app.route("/get_model_info", methods=["GET"])
 def get_model_info():
@@ -217,7 +300,8 @@ def get_ek():
 
 @app.route("/get_key", methods=["GET"])
 def get_key():
-    allowed, msg = check_rate_limit(MODEL_INDEX, DIMENSION)
+    logger.info("Received request for Functional Key (sk).")
+    allowed, msg, entry_id = reserve_key_issuance(MODEL_INDEX, DIMENSION, request.remote_addr)
     if not allowed:
         logger.warning(f"[RATE LIMIT] {msg}")
         return jsonify({"error": msg}), 429
@@ -234,29 +318,22 @@ def get_key():
         sealed_box = SealedBox(cloud_pk)
         encrypted_sk = sealed_box.encrypt(json_sk.encode("utf-8"))
         encoded_sealed_sk = base64.b64encode(encrypted_sk).decode("utf-8")
-        
-        entry = {
-            "timestamp": time.time(),
-            "model_index": MODEL_INDEX,
-            "requester_ip": request.remote_addr,
-            "count": len(key_issuance_log[MODEL_INDEX]) + 1,
-            "limit": DIMENSION // 2,
-        }
-        key_issuance_log[MODEL_INDEX].append(entry)
+        logger.info("Successfully generated and sealed Functional Key.")
         return jsonify({"functional_key": encoded_sealed_sk})
     except Exception as e:
+        rollback_key_issuance(MODEL_INDEX, entry_id)
         logger.error(f"Error generating Functional Key: {str(e)}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/get_pathway_keys', methods=['GET'])
 def get_pathway_keys():
-    allowed, remaining = check_xai_budget(request.remote_addr)
+    allowed, remaining, entry_id = reserve_xai_budget(request.remote_addr)
     if not allowed:
         return jsonify({
             "error": "XAI privacy budget exhausted",
             "total_budget": XAI_TOTAL_BUDGET,
-            "spent": xai_budget_spent,
+            "spent": XAI_TOTAL_BUDGET - remaining,
             "remaining": remaining,
         }), 429
 
@@ -277,9 +354,9 @@ def get_pathway_keys():
             encrypted_sk = sealed_box.encrypt(json_sk.encode('utf-8'))
             sealed_pathway_keys[name] = base64.b64encode(encrypted_sk).decode('utf-8')
 
-        spend_xai_budget(request.remote_addr)
         return jsonify({"pathway_keys": sealed_pathway_keys})
     except Exception as e:
+        rollback_xai_budget(entry_id)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
@@ -331,6 +408,13 @@ def query_log():
             "entries": history,
         }
     return jsonify({"key_issuance_log": summary})
+
+@app.route('/debug/force_reload_state', methods=['POST'])
+def force_reload_state():
+    if os.environ.get("TEST_MODE") != "1":
+        return jsonify({"error": "Not Found"}), 404
+    _load_state()
+    return jsonify({"status": "State reloaded from disk"})
 
 if __name__ == "__main__":
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
