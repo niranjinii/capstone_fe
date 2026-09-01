@@ -160,10 +160,12 @@ def evaluate():
         audit_chain.log_evaluation(query_id, ct_hash, result)
 
         return jsonify({"encrypted_result": result})
+    except (ValueError, KeyError, TypeError) as e:
+        logger.warning(f"Invalid cryptographic payload (Tampering detected): {str(e)}")
+        return jsonify({"error": "Invalid or tampered cryptographic payload"}), 400
     except Exception as e:
-        logger.error(f"Evaluation error: {str(e)}")
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Internal Evaluation error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/evaluate_pathways', methods=['POST'])
 def evaluate_pathways():
@@ -200,9 +202,12 @@ def evaluate_pathways():
             "dp_applied": True,
             "epsilon": XAI_EPSILON
         })
+    except (ValueError, KeyError, TypeError) as e:
+        logger.warning(f"Invalid cryptographic payload (Tampering detected): {str(e)}")
+        return jsonify({"error": "Invalid or tampered cryptographic payload"}), 400
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Internal Evaluation pathways error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/verify_audit_chain', methods=['GET'])
 def verify_audit_chain():
@@ -248,10 +253,12 @@ def evaluate_batch():
 
         logger.info("Batch evaluation complete.")
         return jsonify({"results": results})
+    except (ValueError, KeyError, TypeError) as e:
+        logger.warning(f"Invalid cryptographic payload in batch (Tampering detected): {str(e)}")
+        return jsonify({"error": "Invalid or tampered cryptographic payload"}), 400
     except Exception as e:
         logger.error(f"Batch evaluation error: {str(e)}")
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
     # --- mTLS (Task 5, Item #7) ---
@@ -260,4 +267,10 @@ if __name__ == "__main__":
     context.load_verify_locations('ca.pem')
     context.verify_mode = ssl.CERT_REQUIRED  # mTLS: reject clients without a valid cert
     print("[mTLS] Cloud starting with mutual TLS on port 5002...")
-    app.run(port=5002, ssl_context=context)
+    try:
+        app.run(port=5002, ssl_context=context)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        import os
+        os._exit(0)

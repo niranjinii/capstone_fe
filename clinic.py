@@ -1,9 +1,21 @@
 import sys
+import os
 import math
 import uuid
 import time
 import numpy as np
 import requests
+import argparse
+import hashlib
+from patient_store import XenaPatientStore
+
+# --- Auto-detect the Xena file next to clinic.py ---
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_XENA_FILE = os.path.join(_SCRIPT_DIR, "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena")
+if not os.path.exists(_XENA_FILE):
+    print("[Clinic] ERROR: Could not find EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena next to clinic.py.")
+    sys.exit(1)
+
 import json
 import logging
 from nacl.signing import SigningKey, VerifyKey
@@ -18,13 +30,39 @@ logger = logging.getLogger("Clinic")
 
 logger.info("--- Starting Clinic Inference Workflow (XAI & Security Edition) ---")
 
+# --- Interactive doctor login ---
+def _load_doctor() -> tuple[str, object]:
+    """Prompt for doctor name, resolve to dr_<name>.key, load signing key."""
+    print("\n" + "=" * 50)
+    print("  DOCTOR LOGIN")
+    print("=" * 50)
+    while True:
+        raw = input("  Doctor name (e.g. 'alice' or 'dr_alice'): ").strip()
+        if not raw:
+            continue
+        # Normalise: strip leading 'dr ' / 'dr_', lowercase, replace spaces with _
+        normalised = raw.lower().replace(" ", "_")
+        if not normalised.startswith("dr_"):
+            normalised = "dr_" + normalised
+        key_file = os.path.join(_SCRIPT_DIR, f"{normalised}.key")
+        if not os.path.exists(key_file):
+            print(f"  Key file not found: {key_file}")
+            print("  Make sure the doctor has been registered with register_doctor.py")
+            continue
+        from nacl.signing import SigningKey as _SK
+        with open(key_file, "rb") as f:
+            sk = _SK(f.read())
+        print(f"  Logged in as: {normalised}  (key: {os.path.basename(key_file)})")
+        return normalised, sk
+
+doctor_id, doctor_signing_key = _load_doctor()
+
 HOSPITAL_URL = 'https://127.0.0.1:5001'
 CLOUD_URL    = 'https://127.0.0.1:5002'
 
-# --- mTLS client credentials (Task 5, Item #7) ---
-# SESSION_KWARGS is splatted into every requests.get/post call so that:
-#   cert=   presents the Clinic's own certificate to the server (mTLS client auth)
-#   verify= tells requests to validate the server cert against our private CA
+# --- mTLS client credentials ---
+# cert=   presents the Clinic's own certificate to the server (mTLS client auth)
+# verify= validates the server cert against our private CA (NOT False — actual verification)
 SESSION_KWARGS = {
     'cert':   ('clinic.pem', 'clinic-key.pem'),
     'verify': 'ca.pem',
@@ -44,18 +82,31 @@ cloud_vk = VerifyKey(cloud_vk_hex.encode('utf-8'), encoder=nacl.encoding.HexEnco
 def secure_request(method, url, server_vk, **kwargs):
     """Wraps requests.request to add mTLS args, sign POST payloads, and verify response signatures."""
     kwargs.update(SESSION_KWARGS)
+    headers = kwargs.get('headers', {})
+
+    # --- Doctor auth headers (🛡️ replay-resistant) ---
+    from urllib.parse import urlparse
+    path = urlparse(url).path
+    doc_nonce = str(uuid.uuid4())
+    doc_timestamp = str(int(time.time()))
+    doc_sig_payload = f"{method}|{path}|{doc_timestamp}|{doc_nonce}".encode()
+    headers["X-Doctor-ID"] = doctor_id
+    headers["X-Doctor-Timestamp"] = doc_timestamp
+    headers["X-Doctor-Nonce"] = doc_nonce
+    headers["X-Doctor-Signature"] = doctor_signing_key.sign(doc_sig_payload).signature.hex()
     
     if method == 'POST' and 'json' in kwargs:
         payload_bytes = json.dumps(kwargs['json'], separators=(',', ':')).encode('utf-8')
         sig_hex = clinic_signing_key.sign(payload_bytes).signature.hex()
         
-        headers = kwargs.get('headers', {})
         headers['X-Signature'] = sig_hex
         headers['X-Verify-Key'] = clinic_vk_hex
         headers['Content-Type'] = 'application/json'
         kwargs['headers'] = headers
         kwargs['data'] = payload_bytes
         del kwargs['json']
+    else:
+        kwargs['headers'] = headers
         
     resp = requests.request(method, url, **kwargs)
     
@@ -99,9 +150,30 @@ bucket_dim = info_resp["bucket_dimension"]
 logger.info(f"Target: {cancer_name} | Bucket: '{bucket_name}' (Dimension: {bucket_dim})")
 
 # 2. Load & Pad Real Patient Expression Vector
-logger.info("Loading real patient data from 'patient1_full.npy'...")
-full_patient = np.load("patient1_full.npy")
-raw_patient = full_patient[active_indices]
+# --- Dynamic Patient Loading via XenaPatientStore ---
+store = XenaPatientStore(_XENA_FILE)
+
+# Interactive patient selection — type in the TCGA barcode at runtime
+print("\nPatient IDs are TCGA barcodes, e.g. TCGA-OR-A5J1-01")
+print("Hint: cancer type is encoded in the barcode prefix:")
+print("  ACC  (adrenocortical):  TCGA-OR-...")
+print("  BRCA (breast):          TCGA-A8-, TCGA-AN-, TCGA-AO-...")
+print("  KIRC (kidney clear):    TCGA-B0-, TCGA-BP-...")
+print("  LUAD (lung adeno):      TCGA-05-, TCGA-38-...")
+print("  PRAD (prostate):        TCGA-CH-, TCGA-EJ-...")
+while True:
+    patient_id = input("\nEnter patient ID (TCGA barcode): ").strip()
+    if store.patient_exists(patient_id):
+        break
+    print(f"  Unknown patient ID {patient_id!r}. Try again.")
+
+full_patient = store.get_patient_vector(patient_id)
+known_label = store.get_patient_label(patient_id)
+patient_id_hash = hashlib.sha256(patient_id.encode()).hexdigest()[:16]
+logger.info(f"Loaded patient [{patient_id_hash}...] (dataset label: {known_label})")
+
+
+raw_patient = full_patient[active_indices]  # type: ignore[index]
 
 SCALING_FACTOR = 5.0
 raw_quantized_patient = [int(val) for val in np.rint(raw_patient * SCALING_FACTOR)]
@@ -146,7 +218,7 @@ logger.info(f"Dispatching single evaluation to Cloud (query_id={query_id})...")
 single_payload = {
     "ciphertext": json_ct,
     "functional_key": json_sk,
-    "query_id": query_id,
+    "query_id": str(query_id) + "-xai",
     "timestamp": query_timestamp,
 }
 cloud_resp = secure_request('POST', f"{CLOUD_URL}/evaluate", cloud_vk, json=single_payload).json()
@@ -191,6 +263,8 @@ print(f"  Risk Level   :  {risk_probability:.2f}%")
 risk_bar_len = int(risk_probability / 2)
 risk_bar = "#" * risk_bar_len + "-" * (50 - risk_bar_len)
 print(f"  Risk Bar     :  [{risk_bar}]")
+if known_label:
+    print(f"  Dataset Label  :  {known_label}  (TCGA ground truth — not the model's prediction)")
 print("-" * 70)
 print("  SECURITY CHECKS")
 print("-" * 70)
@@ -204,8 +278,8 @@ if pathway_keys:
     pathway_payload = { 
         "ciphertext": json_ct, 
         "pathway_keys": pathway_keys,
-        "query_id": query_id,
-        "timestamp": query_timestamp
+        "query_id": str(uuid.uuid4()),
+        "timestamp": int(time.time())
     }
     pathway_response = secure_request('POST', f'{CLOUD_URL}/evaluate_pathways', cloud_vk, json=pathway_payload)
     pathway_raw_results = pathway_response.json()['pathway_results']
@@ -263,7 +337,7 @@ if pathway_keys:
     print("  PRIVACY BUDGET")
     print("-" * 70)
     try:
-        budget_resp = secure_request('GET', f'{HOSPITAL_URL}/xai_privacy_budget', hospital_vk).json()
+        budget_resp = secure_request('GET', f'{HOSPITAL_URL}/doctor_budget', hospital_vk).json()
         remaining = budget_resp.get('remaining', 0)
         total = budget_resp.get('total_budget', 0)
         queries = budget_resp.get('queries_made', 0)

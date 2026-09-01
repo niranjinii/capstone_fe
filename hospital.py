@@ -1,11 +1,16 @@
 import argparse
 import base64
 import traceback
-import time
+import threading
+import json
+import os
+import uuid
 import ssl
 from collections import defaultdict
 import numpy as np
 import requests
+import urllib3
+urllib3.disable_warnings()
 import logging
 from flask import Flask, jsonify, request
 
@@ -19,7 +24,7 @@ from fhipe_serializer import serialize_functional_key
 from delegated_crypto import generate_ek, serialize_ek
 from bucketing import get_cancer_type_name, get_bucket_info, pad_weights
 from mcl_backend import MclPairing, fast_feddh_generate
-import time as _time
+import time
 from pathway_xai import load_hallmark_pathways, build_pathway_vectors
 from audit_log import run_decoy_verification
 from rho_blinding import generate_rho, extend_weight_vector
@@ -30,8 +35,117 @@ logger = logging.getLogger("Hospital")
 app = Flask(__name__)
 
 # --- Payload Signing Key (Item #7, Member C) ---
-hospital_signing_key = SigningKey.generate()
+SIGNING_KEY_FILE = "hospital_signing.key"
+if os.path.exists(SIGNING_KEY_FILE):
+    with open(SIGNING_KEY_FILE, "rb") as f:
+        hospital_signing_key = SigningKey(f.read())
+else:
+    hospital_signing_key = SigningKey.generate()
+    with open(SIGNING_KEY_FILE, "wb") as f:
+        f.write(hospital_signing_key.encode())
+        
 hospital_verify_key = hospital_signing_key.verify_key
+
+# --- Admin Verify Key (for budget resets) ---
+ADMIN_VERIFY_FILE = "admin_verify.pub"
+if os.path.exists(ADMIN_VERIFY_FILE):
+    with open(ADMIN_VERIFY_FILE, "rb") as f:
+        admin_verify_key = VerifyKey(f.read())
+    logger.info("[ADMIN] Admin verify key loaded — /reset_budget endpoint active.")
+else:
+    admin_verify_key = None
+    logger.warning("[ADMIN] No admin_verify.pub found — /reset_budget will return 503.")
+
+budget_epoch = 0
+
+# --- Doctor Registry (per-doctor access control) ---
+DOCTOR_REGISTRY_FILE = "doctor_registry.json"
+doctor_registry = {}   # doctor_id -> {verify_key, budget, enabled}
+doctor_budgets = {}    # doctor_id -> {spent: float, log: list}  (runtime, persisted in state)
+
+def _load_doctor_registry():
+    """Load and verify the signed doctor registry."""
+    global doctor_registry
+    if not os.path.exists(DOCTOR_REGISTRY_FILE):
+        logger.warning("[DOCTORS] No doctor_registry.json — doctor-authenticated endpoints will reject all requests.")
+        return
+
+    with open(DOCTOR_REGISTRY_FILE) as f:
+        wrapper = json.load(f)
+
+    # 🛡️ Gap #2: NO unsigned fallback — missing signature is a hard failure
+    if "signature" not in wrapper or "data_hex" not in wrapper:
+        raise RuntimeError(
+            f"FATAL: {DOCTOR_REGISTRY_FILE} is missing its signature wrapper. "
+            "File may be tampered with or was written by an old version of register_doctor.py. "
+            "Re-run register_doctor.py to regenerate a signed registry."
+        )
+
+    data_bytes = bytes.fromhex(wrapper["data_hex"])
+    signature = bytes.fromhex(wrapper["signature"])
+    hospital_verify_key.verify(data_bytes, signature)  # raises BadSignatureError if tampered
+
+    doctor_registry = json.loads(data_bytes.decode("utf-8"))
+    for doc_id in doctor_registry:
+        if doc_id not in doctor_budgets:
+            doctor_budgets[doc_id] = {"spent": 0.0, "log": []}
+    logger.info(f"[DOCTORS] Loaded {len(doctor_registry)} doctors from signed registry.")
+
+_load_doctor_registry()
+
+# --- Doctor Nonce Tracking (prevents signature replay) ---
+_seen_doctor_nonces = {}  # nonce_str -> expiry_timestamp
+
+
+def _prune_expired_nonces():
+    """Remove nonces older than 120 seconds. Called periodically."""
+    now = time.time()
+    expired = [n for n, exp in _seen_doctor_nonces.items() if now > exp]
+    for n in expired:
+        del _seen_doctor_nonces[n]
+
+
+def authenticate_doctor(req) -> tuple[str | None, str | None]:
+    """
+    Verify doctor identity from request headers.
+    Returns (doctor_id, None) on success, or (None, error_message) on failure.
+    """
+    doctor_id = req.headers.get("X-Doctor-ID")
+    ts_str = req.headers.get("X-Doctor-Timestamp")
+    nonce = req.headers.get("X-Doctor-Nonce")
+    sig_hex = req.headers.get("X-Doctor-Signature")
+
+    if not all([doctor_id, ts_str, nonce, sig_hex]):
+        return None, "Missing doctor auth headers (need X-Doctor-ID, X-Doctor-Timestamp, X-Doctor-Nonce, X-Doctor-Signature)"
+
+    try:
+        ts = int(ts_str)
+    except ValueError:
+        return None, "Invalid X-Doctor-Timestamp"
+    if abs(time.time() - ts) > 60:
+        return None, "Stale or future-dated request (>60s drift)"
+
+    _prune_expired_nonces()
+    if nonce in _seen_doctor_nonces:
+        return None, "Replayed nonce — possible replay attack"
+
+    if doctor_id not in doctor_registry:
+        return None, f"Unknown doctor: {doctor_id!r}"
+    if not doctor_registry[doctor_id].get("enabled", False):
+        return None, f"Doctor {doctor_id!r} is disabled"
+
+    sig_payload = f"{req.method}|{req.path}|{ts_str}|{nonce}".encode()
+    try:
+        vk = VerifyKey(
+            doctor_registry[doctor_id]["verify_key"].encode(),
+            encoder=nacl.encoding.HexEncoder
+        )
+        vk.verify(sig_payload, bytes.fromhex(sig_hex))
+    except BadSignatureError:
+        return None, f"Invalid signature for doctor {doctor_id!r}"
+
+    _seen_doctor_nonces[nonce] = time.time() + 120
+    return doctor_id, None
 
 @app.route('/signing_key', methods=['GET'])
 def get_signing_key():
@@ -152,37 +266,126 @@ XAI_TOTAL_BUDGET = 10.0
 xai_budget_spent = 0.0
 xai_query_log = []
 
-def check_xai_budget(request_ip):
-    global xai_budget_spent
-    remaining = XAI_TOTAL_BUDGET - xai_budget_spent
-    if remaining < XAI_EPSILON_PER_QUERY:
-        return False, remaining
-    return True, remaining
+# WARNING: This lock only synchronizes threads within a single process.
+# If deployed via gunicorn with multiple workers (e.g., -w 4), this state is not shared,
+# and attackers get 4x the budget. A Redis backend is required for multi-process deployments.
+state_lock = threading.Lock()
+STATE_FILE = "hospital_state.json"
 
-def spend_xai_budget(request_ip):
-    global xai_budget_spent
-    xai_budget_spent += XAI_EPSILON_PER_QUERY
-    remaining = XAI_TOTAL_BUDGET - xai_budget_spent
-    xai_query_log.append({
-        'timestamp': _time.time(),
-        'ip': request_ip,
-        'epsilon_spent': XAI_EPSILON_PER_QUERY,
-        'total_spent': xai_budget_spent,
-        'remaining': remaining,
-    })
-    if remaining <= XAI_TOTAL_BUDGET * 0.25:
-        logger.warning(f"[XAI] WARNING: Privacy budget at {remaining:.1f}/{XAI_TOTAL_BUDGET} epsilon")
-    return remaining
+def _save_state():
+    state = {
+        "xai_budget_spent": xai_budget_spent,
+        "xai_query_log": xai_query_log,
+        "key_issuance_log": {f"{k[0]}|{k[1]}": v for k, v in key_issuance_log.items()},
+        "budget_epoch": budget_epoch,
+        "doctor_budgets": doctor_budgets
+    }
+    state_bytes = json.dumps(state).encode("utf-8")
+    signature = hospital_signing_key.sign(state_bytes).signature.hex()
+    
+    wrapper = {
+        "signature": signature,
+        "data_hex": state_bytes.hex()
+    }
+    tmp_file = STATE_FILE + ".tmp"
+    with open(tmp_file, "w") as f:
+        json.dump(wrapper, f)
+    os.replace(tmp_file, STATE_FILE)
 
-def check_rate_limit(model_index, dimension):
-    max_allowed = max(1, dimension // 2)
-    history = key_issuance_log[model_index]
-    count = len(history)
-    if count >= max_allowed:
-        return False, f"Rate limit reached: {count}/{max_allowed} keys issued for model {model_index}"
-    if count >= int(0.75 * max_allowed):
-        logger.warning(f"Model {model_index}: {count}/{max_allowed} keys issued — approaching extraction threshold!")
-    return True, "OK"
+def _load_state():
+    global xai_budget_spent, xai_query_log, key_issuance_log, budget_epoch, doctor_budgets
+    if not os.path.exists(STATE_FILE):
+        return
+    with open(STATE_FILE, "r") as f:
+        wrapper = json.load(f)
+    
+    data_bytes = bytes.fromhex(wrapper["data_hex"])
+    signature = bytes.fromhex(wrapper["signature"])
+    
+    # Will throw nacl.exceptions.BadSignatureError and crash if tampered
+    hospital_verify_key.verify(data_bytes, signature)
+    
+    state = json.loads(data_bytes.decode("utf-8"))
+    xai_budget_spent = state.get("xai_budget_spent", 0.0)
+    xai_query_log = state.get("xai_query_log", [])
+    key_issuance_log.clear()
+    
+    for compound_key_str, v in state.get("key_issuance_log", {}).items():
+        parts = compound_key_str.split("|", 1)
+        if len(parts) == 2:
+            key_issuance_log[(int(parts[0]), parts[1])] = v
+        else:
+            key_issuance_log[(int(parts[0]), "__legacy__")] = v
+
+    budget_epoch = state.get("budget_epoch", 0)
+    loaded_doc_budgets = state.get("doctor_budgets", {})
+    for k, v in loaded_doc_budgets.items():
+        doctor_budgets[k] = v
+
+_load_state()
+
+def reserve_doctor_budget(doctor_id: str):
+    with state_lock:
+        quota = doctor_registry[doctor_id]["budget"]
+        doc_state = doctor_budgets[doctor_id]
+        remaining = quota - doc_state["spent"]
+        if remaining < XAI_EPSILON_PER_QUERY:
+            return False, remaining, None
+
+        doc_state["spent"] += XAI_EPSILON_PER_QUERY
+        remaining_after = quota - doc_state["spent"]
+        entry_id = str(uuid.uuid4())
+        doc_state["log"].append({
+            "id": entry_id,
+            "timestamp": time.time(),
+            "epsilon_spent": XAI_EPSILON_PER_QUERY,
+            "total_spent": doc_state["spent"],
+            "remaining": remaining_after,
+        })
+        if remaining_after <= quota * 0.25:
+            logger.warning(f"[BUDGET] Doctor {doctor_id}: {remaining_after:.1f}/{quota} epsilon remaining")
+        _save_state()
+        return True, remaining_after, entry_id
+
+
+def rollback_doctor_budget(doctor_id: str, entry_id: str):
+    with state_lock:
+        doc_state = doctor_budgets[doctor_id]
+        doc_state["spent"] -= XAI_EPSILON_PER_QUERY
+        doc_state["log"] = [e for e in doc_state["log"] if e.get("id") != entry_id]
+        _save_state()
+
+def reserve_key_issuance(model_index, dimension, doctor_id):
+    with state_lock:
+        compound_key = (model_index, doctor_id)
+        max_allowed = max(1, dimension // 2)
+        history = key_issuance_log[compound_key]
+        count = len(history)
+        if count >= max_allowed:
+            return False, f"Key rate limit: {count}/{max_allowed} keys for model {model_index}, doctor {doctor_id}", None
+        if count >= int(0.75 * max_allowed):
+            logger.warning(f"[RATE LIMIT] Model {model_index}, doctor {doctor_id}: {count}/{max_allowed} keys — approaching limit")
+
+        entry_id = str(uuid.uuid4())
+        entry = {
+            "id": entry_id,
+            "timestamp": time.time(),
+            "model_index": model_index,
+            "doctor_id": doctor_id,
+            "count": count + 1,
+            "limit": max_allowed,
+        }
+        key_issuance_log[compound_key].append(entry)
+        _save_state()
+        return True, "OK", entry_id
+
+def rollback_key_issuance(model_index, doctor_id, entry_id):
+    with state_lock:
+        compound_key = (model_index, doctor_id)
+        key_issuance_log[compound_key] = [
+            e for e in key_issuance_log[compound_key] if e.get("id") != entry_id
+        ]
+        _save_state()
 
 @app.route("/get_model_info", methods=["GET"])
 def get_model_info():
@@ -217,7 +420,13 @@ def get_ek():
 
 @app.route("/get_key", methods=["GET"])
 def get_key():
-    allowed, msg = check_rate_limit(MODEL_INDEX, DIMENSION)
+    logger.info("Received request for Functional Key (sk).")
+    # Doctor authentication gate
+    doctor_id, err = authenticate_doctor(request)
+    if err:
+        return jsonify({"error": err}), 403
+
+    allowed, msg, entry_id = reserve_key_issuance(MODEL_INDEX, DIMENSION, doctor_id)
     if not allowed:
         logger.warning(f"[RATE LIMIT] {msg}")
         return jsonify({"error": msg}), 429
@@ -234,29 +443,26 @@ def get_key():
         sealed_box = SealedBox(cloud_pk)
         encrypted_sk = sealed_box.encrypt(json_sk.encode("utf-8"))
         encoded_sealed_sk = base64.b64encode(encrypted_sk).decode("utf-8")
-        
-        entry = {
-            "timestamp": time.time(),
-            "model_index": MODEL_INDEX,
-            "requester_ip": request.remote_addr,
-            "count": len(key_issuance_log[MODEL_INDEX]) + 1,
-            "limit": DIMENSION // 2,
-        }
-        key_issuance_log[MODEL_INDEX].append(entry)
+        logger.info("Successfully generated and sealed Functional Key.")
         return jsonify({"functional_key": encoded_sealed_sk})
     except Exception as e:
+        rollback_key_issuance(MODEL_INDEX, doctor_id, entry_id)
         logger.error(f"Error generating Functional Key: {str(e)}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/get_pathway_keys', methods=['GET'])
 def get_pathway_keys():
-    allowed, remaining = check_xai_budget(request.remote_addr)
+    # Doctor authentication gate
+    doctor_id, err = authenticate_doctor(request)
+    if err:
+        return jsonify({"error": err}), 403
+
+    allowed, remaining, entry_id = reserve_doctor_budget(doctor_id)
     if not allowed:
         return jsonify({
-            "error": "XAI privacy budget exhausted",
-            "total_budget": XAI_TOTAL_BUDGET,
-            "spent": xai_budget_spent,
+            "error": "XAI privacy budget exhausted for this doctor",
+            "doctor_id": doctor_id,
             "remaining": remaining,
         }), 429
 
@@ -277,21 +483,45 @@ def get_pathway_keys():
             encrypted_sk = sealed_box.encrypt(json_sk.encode('utf-8'))
             sealed_pathway_keys[name] = base64.b64encode(encrypted_sk).decode('utf-8')
 
-        spend_xai_budget(request.remote_addr)
         return jsonify({"pathway_keys": sealed_pathway_keys})
     except Exception as e:
+        rollback_doctor_budget(doctor_id, entry_id)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/xai_privacy_budget', methods=['GET'])
 def get_xai_privacy_budget():
+    """Per-doctor budget summary. If no doctor auth provided, returns global summary."""
+    doctor_id, err = authenticate_doctor(request)
+    if err:
+        # Fall back to global summary (unauthenticated monitoring endpoint)
+        total_spent = sum(v.get("spent", 0.0) for v in doctor_budgets.values())
+        return jsonify({
+            "note": "Aggregate across all doctors — authenticate as a doctor for personal budget",
+            "total_budget_per_doctor": XAI_EPSILON_PER_QUERY,
+            "doctors": {
+                did: {
+                    "quota": doctor_registry.get(did, {}).get("budget", XAI_TOTAL_BUDGET),
+                    "spent": v.get("spent", 0.0),
+                    "remaining": doctor_registry.get(did, {}).get("budget", XAI_TOTAL_BUDGET) - v.get("spent", 0.0),
+                    "queries_made": len(v.get("log", [])),
+                }
+                for did, v in doctor_budgets.items()
+            },
+            "budget_epoch": budget_epoch,
+        })
+
+    quota = doctor_registry[doctor_id]["budget"]
+    doc_state = doctor_budgets.get(doctor_id, {"spent": 0.0, "log": []})
     return jsonify({
-        "total_budget": XAI_TOTAL_BUDGET,
-        "spent": xai_budget_spent,
-        "remaining": XAI_TOTAL_BUDGET - xai_budget_spent,
-        "queries_made": len(xai_query_log),
-        "max_queries_allowed": int(XAI_TOTAL_BUDGET / XAI_EPSILON_PER_QUERY),
-        "access_log": xai_query_log,
+        "doctor_id": doctor_id,
+        "total_budget": quota,
+        "spent": doc_state["spent"],
+        "remaining": quota - doc_state["spent"],
+        "queries_made": len(doc_state["log"]),
+        "max_queries_allowed": int(quota / XAI_EPSILON_PER_QUERY),
+        "access_log": doc_state["log"],
+        "budget_epoch": budget_epoch,
     })
 
 @app.route('/verify_cloud', methods=['GET'])
@@ -332,10 +562,101 @@ def query_log():
         }
     return jsonify({"key_issuance_log": summary})
 
+@app.route('/debug/force_reload_state', methods=['POST'])
+def force_reload_state():
+    if os.environ.get("TEST_MODE") != "1":
+        return jsonify({"error": "Not Found"}), 404
+    _load_state()
+    return jsonify({"status": "State reloaded from disk"})
+
+@app.route('/reset_budget', methods=['POST'])
+def reset_budget():
+    global xai_budget_spent, xai_query_log, budget_epoch
+
+    if admin_verify_key is None:
+        return jsonify({"error": "Budget reset not configured (no admin_verify.pub)"}), 503
+
+    token_b64 = request.json.get("token")
+    if not token_b64:
+        return jsonify({"error": "Missing 'token' field"}), 400
+
+    # Verify admin signature
+    try:
+        token_signed = base64.b64decode(token_b64)
+        payload_bytes = admin_verify_key.verify(token_signed)
+        token = json.loads(payload_bytes)
+    except BadSignatureError:
+        logger.error("[ADMIN] Budget reset REJECTED: invalid admin signature")
+        return jsonify({"error": "Invalid admin signature"}), 403
+    except Exception as e:
+        return jsonify({"error": f"Malformed token: {e}"}), 400
+
+    # Validate token fields
+    if token.get("action") != "reset_budget":
+        return jsonify({"error": "Wrong token action"}), 400
+    if token["target_epoch"] != budget_epoch + 1:
+        return jsonify({
+            "error": f"Epoch mismatch: expected {budget_epoch + 1}, got {token['target_epoch']}"
+        }), 409
+    if time.time() - token["issued_at"] > 300:
+        return jsonify({"error": "Token expired (>5 min old)"}), 410
+
+    scope = token.get("scope", "global")
+
+    # 🛡️ Gap #4: validate scope target BEFORE incrementing epoch
+    if scope.startswith("doctor:"):
+        target_doc = scope.split(":", 1)[1]
+        if target_doc not in doctor_budgets:
+            return jsonify({"error": f"Unknown doctor '{target_doc}' in scope"}), 404
+
+    with state_lock:
+        if scope == "global":
+            xai_budget_spent = 0.0
+            xai_query_log = []
+            for doc_state in doctor_budgets.values():
+                doc_state["spent"] = 0.0
+                doc_state["log"] = []
+            # Also reset global key issuance log
+            key_issuance_log.clear()
+        elif scope.startswith("doctor:"):
+            target_doc = scope.split(":", 1)[1]
+            doctor_budgets[target_doc]["spent"] = 0.0
+            doctor_budgets[target_doc]["log"] = []
+            # Reset that doctor's key issuance entries too
+            keys_to_clean = [k for k in key_issuance_log if k[1] == target_doc]
+            for k in keys_to_clean:
+                del key_issuance_log[k]
+
+        budget_epoch += 1
+        _save_state()
+
+    logger.info(f"[ADMIN] Budget reset OK. scope={scope}, new_epoch={budget_epoch}")
+    return jsonify({"status": "reset", "scope": scope, "new_epoch": budget_epoch})
+
+@app.route('/doctor_budget', methods=['GET'])
+def get_doctor_budget():
+    doctor_id, err = authenticate_doctor(request)
+    if err:
+        return jsonify({"error": err}), 403
+
+    quota = doctor_registry[doctor_id]["budget"]
+    doc_state = doctor_budgets.get(doctor_id, {"spent": 0.0, "log": []})
+    return jsonify({
+        "doctor_id": doctor_id,
+        "total_budget": quota,
+        "spent": doc_state["spent"],
+        "remaining": quota - doc_state["spent"],
+        "queries_made": len(doc_state["log"]),
+        "budget_epoch": budget_epoch,
+    })
+
 if __name__ == "__main__":
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain('hospital.pem', 'hospital-key.pem')
     context.load_verify_locations('ca.pem')
     context.verify_mode = ssl.CERT_REQUIRED
     logger.info("[mTLS] Hospital starting with mutual TLS on port 5001...")
-    app.run(port=5001, ssl_context=context)
+    try:
+        app.run(port=5001, ssl_context=context)
+    except KeyboardInterrupt:
+        pass

@@ -70,7 +70,7 @@ class MerkleAuditLog:
                     data = json.load(f)
                     self.entries = data.get('entries', [])
                     self.leaf_hashes = [e.get('entry_hash', '') for e in self.entries]
-                    self.merkle_root = self._compute_merkle_root()
+                    self.merkle_root = data.get('merkle_root', '0' * 64)
             except json.JSONDecodeError:
                 pass
 
