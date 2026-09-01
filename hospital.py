@@ -436,7 +436,7 @@ def get_key():
         json_sk = serialize_functional_key(sk)
         
         # PyNaCl Sealed Key Delivery via mTLS to Cloud
-        cloud_resp = requests.get("https://127.0.0.1:5002/public_key", cert=('hospital.pem', 'hospital-key.pem'), verify=False).json()
+        cloud_resp = requests.get("https://127.0.0.1:5002/public_key", cert=('hospital.pem', 'hospital-key.pem'), verify='ca.pem').json()
         cloud_pk_bytes = base64.b64decode(cloud_resp["public_key"])
         cloud_pk = PublicKey(cloud_pk_bytes)
         
@@ -467,7 +467,7 @@ def get_pathway_keys():
         }), 429
 
     try:
-        cloud_resp = requests.get('https://127.0.0.1:5002/public_key', cert=('hospital.pem', 'hospital-key.pem'), verify=False).json()
+        cloud_resp = requests.get('https://127.0.0.1:5002/public_key', cert=('hospital.pem', 'hospital-key.pem'), verify='ca.pem').json()
         cloud_pk_bytes = base64.b64decode(cloud_resp['public_key'])
         cloud_pk = PublicKey(cloud_pk_bytes)
         sealed_box = SealedBox(cloud_pk)
@@ -491,13 +491,37 @@ def get_pathway_keys():
 
 @app.route('/xai_privacy_budget', methods=['GET'])
 def get_xai_privacy_budget():
+    """Per-doctor budget summary. If no doctor auth provided, returns global summary."""
+    doctor_id, err = authenticate_doctor(request)
+    if err:
+        # Fall back to global summary (unauthenticated monitoring endpoint)
+        total_spent = sum(v.get("spent", 0.0) for v in doctor_budgets.values())
+        return jsonify({
+            "note": "Aggregate across all doctors — authenticate as a doctor for personal budget",
+            "total_budget_per_doctor": XAI_EPSILON_PER_QUERY,
+            "doctors": {
+                did: {
+                    "quota": doctor_registry.get(did, {}).get("budget", XAI_TOTAL_BUDGET),
+                    "spent": v.get("spent", 0.0),
+                    "remaining": doctor_registry.get(did, {}).get("budget", XAI_TOTAL_BUDGET) - v.get("spent", 0.0),
+                    "queries_made": len(v.get("log", [])),
+                }
+                for did, v in doctor_budgets.items()
+            },
+            "budget_epoch": budget_epoch,
+        })
+
+    quota = doctor_registry[doctor_id]["budget"]
+    doc_state = doctor_budgets.get(doctor_id, {"spent": 0.0, "log": []})
     return jsonify({
-        "total_budget": XAI_TOTAL_BUDGET,
-        "spent": xai_budget_spent,
-        "remaining": XAI_TOTAL_BUDGET - xai_budget_spent,
-        "queries_made": len(xai_query_log),
-        "max_queries_allowed": int(XAI_TOTAL_BUDGET / XAI_EPSILON_PER_QUERY),
-        "access_log": xai_query_log,
+        "doctor_id": doctor_id,
+        "total_budget": quota,
+        "spent": doc_state["spent"],
+        "remaining": quota - doc_state["spent"],
+        "queries_made": len(doc_state["log"]),
+        "max_queries_allowed": int(quota / XAI_EPSILON_PER_QUERY),
+        "access_log": doc_state["log"],
+        "budget_epoch": budget_epoch,
     })
 
 @app.route('/verify_cloud', methods=['GET'])
@@ -508,7 +532,7 @@ def verify_cloud():
         quantized_weights=quantized_weights,
         weight_shift=WEIGHT_SHIFT,
         cert=('hospital.pem', 'hospital-key.pem'),
-        verify=False,
+        verify='ca.pem',
         signing_key=hospital_signing_key
     )
     return jsonify(result)
@@ -636,6 +660,3 @@ if __name__ == "__main__":
         app.run(port=5001, ssl_context=context)
     except KeyboardInterrupt:
         pass
-    finally:
-        import os
-        os._exit(0)

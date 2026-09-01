@@ -1,17 +1,21 @@
 import sys
+import os
 import math
 import uuid
 import time
 import numpy as np
 import requests
-import urllib3
 import argparse
 import hashlib
-from patient_store import TCGAPatientStore
+from patient_store import XenaPatientStore
 
-TCGA_DIR = r"C:\Users\nidhi\OneDrive\College\Capstone\TCGA-PANCAN-HiSeq-801x20531"
+# --- Auto-detect the Xena file next to clinic.py ---
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_XENA_FILE = os.path.join(_SCRIPT_DIR, "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena")
+if not os.path.exists(_XENA_FILE):
+    print("[Clinic] ERROR: Could not find EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena next to clinic.py.")
+    sys.exit(1)
 
-urllib3.disable_warnings()
 import json
 import logging
 from nacl.signing import SigningKey, VerifyKey
@@ -26,29 +30,42 @@ logger = logging.getLogger("Clinic")
 
 logger.info("--- Starting Clinic Inference Workflow (XAI & Security Edition) ---")
 
-parser = argparse.ArgumentParser(description="Clinic Inference Client")
-parser.add_argument("--patient-id", required=True,
-                    help="Patient ID from TCGA dataset, e.g. 'sample_0'")
-parser.add_argument("--doctor-id", required=True,
-                    help="Registered doctor ID, e.g. 'dr_alice'")
-parser.add_argument("--doctor-key", required=True,
-                    help="Path to doctor's Ed25519 private key file")
-args, _ = parser.parse_known_args()
+# --- Interactive doctor login ---
+def _load_doctor() -> tuple[str, object]:
+    """Prompt for doctor name, resolve to dr_<name>.key, load signing key."""
+    print("\n" + "=" * 50)
+    print("  DOCTOR LOGIN")
+    print("=" * 50)
+    while True:
+        raw = input("  Doctor name (e.g. 'alice' or 'dr_alice'): ").strip()
+        if not raw:
+            continue
+        # Normalise: strip leading 'dr ' / 'dr_', lowercase, replace spaces with _
+        normalised = raw.lower().replace(" ", "_")
+        if not normalised.startswith("dr_"):
+            normalised = "dr_" + normalised
+        key_file = os.path.join(_SCRIPT_DIR, f"{normalised}.key")
+        if not os.path.exists(key_file):
+            print(f"  Key file not found: {key_file}")
+            print("  Make sure the doctor has been registered with register_doctor.py")
+            continue
+        from nacl.signing import SigningKey as _SK
+        with open(key_file, "rb") as f:
+            sk = _SK(f.read())
+        print(f"  Logged in as: {normalised}  (key: {os.path.basename(key_file)})")
+        return normalised, sk
 
-from nacl.signing import SigningKey as DoctorSigningKey
-with open(args.doctor_key, "rb") as f:
-    doctor_signing_key = DoctorSigningKey(f.read())
+doctor_id, doctor_signing_key = _load_doctor()
 
 HOSPITAL_URL = 'https://127.0.0.1:5001'
 CLOUD_URL    = 'https://127.0.0.1:5002'
 
-# --- mTLS client credentials (Task 5, Item #7) ---
-# SESSION_KWARGS is splatted into every requests.get/post call so that:
-#   cert=   presents the Clinic's own certificate to the server (mTLS client auth)
-#   verify= tells requests to validate the server cert against our private CA
+# --- mTLS client credentials ---
+# cert=   presents the Clinic's own certificate to the server (mTLS client auth)
+# verify= validates the server cert against our private CA (NOT False — actual verification)
 SESSION_KWARGS = {
     'cert':   ('clinic.pem', 'clinic-key.pem'),
-    'verify': False,
+    'verify': 'ca.pem',
 }
 
 # --- Payload Signing (Task 6, Item #7) ---
@@ -73,7 +90,7 @@ def secure_request(method, url, server_vk, **kwargs):
     doc_nonce = str(uuid.uuid4())
     doc_timestamp = str(int(time.time()))
     doc_sig_payload = f"{method}|{path}|{doc_timestamp}|{doc_nonce}".encode()
-    headers["X-Doctor-ID"] = args.doctor_id
+    headers["X-Doctor-ID"] = doctor_id
     headers["X-Doctor-Timestamp"] = doc_timestamp
     headers["X-Doctor-Nonce"] = doc_nonce
     headers["X-Doctor-Signature"] = doctor_signing_key.sign(doc_sig_payload).signature.hex()
@@ -133,17 +150,30 @@ bucket_dim = info_resp["bucket_dimension"]
 logger.info(f"Target: {cancer_name} | Bucket: '{bucket_name}' (Dimension: {bucket_dim})")
 
 # 2. Load & Pad Real Patient Expression Vector
-# --- Dynamic Patient Loading via PatientStore ---
-store = TCGAPatientStore(TCGA_DIR)
-if not store.patient_exists(args.patient_id):
-    logger.error(f"Unknown patient ID: {args.patient_id!r}")
-    sys.exit(1)
-full_patient = store.get_patient_vector(args.patient_id)
-known_label = store.get_patient_label(args.patient_id)
-patient_id_hash = hashlib.sha256(args.patient_id.encode()).hexdigest()[:16]
+# --- Dynamic Patient Loading via XenaPatientStore ---
+store = XenaPatientStore(_XENA_FILE)
+
+# Interactive patient selection — type in the TCGA barcode at runtime
+print("\nPatient IDs are TCGA barcodes, e.g. TCGA-OR-A5J1-01")
+print("Hint: cancer type is encoded in the barcode prefix:")
+print("  ACC  (adrenocortical):  TCGA-OR-...")
+print("  BRCA (breast):          TCGA-A8-, TCGA-AN-, TCGA-AO-...")
+print("  KIRC (kidney clear):    TCGA-B0-, TCGA-BP-...")
+print("  LUAD (lung adeno):      TCGA-05-, TCGA-38-...")
+print("  PRAD (prostate):        TCGA-CH-, TCGA-EJ-...")
+while True:
+    patient_id = input("\nEnter patient ID (TCGA barcode): ").strip()
+    if store.patient_exists(patient_id):
+        break
+    print(f"  Unknown patient ID {patient_id!r}. Try again.")
+
+full_patient = store.get_patient_vector(patient_id)
+known_label = store.get_patient_label(patient_id)
+patient_id_hash = hashlib.sha256(patient_id.encode()).hexdigest()[:16]
 logger.info(f"Loaded patient [{patient_id_hash}...] (dataset label: {known_label})")
 
-raw_patient = full_patient[active_indices]
+
+raw_patient = full_patient[active_indices]  # type: ignore[index]
 
 SCALING_FACTOR = 5.0
 raw_quantized_patient = [int(val) for val in np.rint(raw_patient * SCALING_FACTOR)]
@@ -367,6 +397,3 @@ except Exception as e:
 print("=" * 70)
 print("                       END OF REPORT")
 print("=" * 70)
-
-import os
-os._exit(0)

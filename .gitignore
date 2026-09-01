@@ -1,13 +1,30 @@
-/__pycache__
-/.
-EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.Python
 venv/
-audit_chain.json
+.capstone/
+
+# --- Cryptographic Keys & Certificates (NEVER commit these) ---
+# Catches any prefix: dr_alice.key, hospital_signing.key, admin_signing.key, etc.
 *.key
+# Catches any prefix: ca.pem, clinic.pem, clinic-key.pem, hospital.pem, etc.
 *.pem
+# Catches any prefix: admin_verify.pub, etc.
 *.pub
-*.patch
-patch*.py
+
+# --- Runtime State (generated at runtime, not source code) ---
+audit_chain.json
 doctor_registry.json
 hospital_state.json
+
+# --- Large Data Files ---
+EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena
+*.cache.npy
+*.cache.meta.json
 patient1_full.npy
+
+# --- Dev/Patch Artifacts ---
+*.patch
+patch*.py
